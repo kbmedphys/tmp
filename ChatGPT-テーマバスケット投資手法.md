@@ -2,8 +2,8 @@
 
 **User:** Anonymous  
 **Created:** 4/27/2026 21:10:39  
-**Updated:** 4/28/2026 0:21:47  
-**Exported:** 4/28/2026 0:22:08  
+**Updated:** 4/28/2026 1:19:13  
+**Exported:** 4/28/2026 1:19:19  
 **Link:** [https://chatgpt.com/c/69ef5235-2b90-83a5-bf87-313d55107d05](https://chatgpt.com/c/69ef5235-2b90-83a5-bf87-313d55107d05)  
 
 ## Response:
@@ -8134,6 +8134,997 @@ date_jst            object
 ```
 
 `timestamp_jst` と `date_jst` を `object`、つまり文字列として保存することで、`datetime64[us, utc]` と `datetime64[ns]` の衝突を避けられます。
+
+## Response:
+2026/4/28 0:28:17
+
+> 思考時間: 2 ～ 3 秒
+
+まだ消えない場合、原因はおそらく **`normalize_headlines_df()` 内だけではなく、`pd.concat(frames)` 後・`drop_duplicates` 後・`to_parquet()` 直前のどこかで datetime 型が再混在している**ためです。添付コードでは `fetch_lseg_news()` が複数クエリの結果を `pd.concat(frames, ignore_index=True)` で結合し、その後 `drop_duplicates("story_id")`、`story_text` 追加を行う構造なので、**保存直前で強制的に parquet-safe な型へ落とす処理**を入れるのが最も確実です。`Pasted code.py`
+
+以下の方針に変えてください。
+
+```text
+timestamp_utc       → 文字列 ISO8601
+retrieved_at_utc    → 文字列 ISO8601
+timestamp_jst       → 文字列 ISO8601
+date_jst            → 文字列 YYYY-MM-DD
+```
+
+バックテストや日次集計で datetime が必要な箇所では、読み込み後に `pd.to_datetime(..., utc=True)` すればよいです。保存時だけ文字列化するのが一番安全です。
+
+---
+
+## 1. まずこの関数を追加してください
+
+`news_loader.py` に追加してください。
+
+```python
+def _make_news_parquet_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert problematic columns to parquet-safe dtypes.
+
+    This function is intentionally conservative:
+    - all timestamp columns are stored as strings
+    - list-like columns are normalized to list[str]
+    - object columns are kept as string/object
+    """
+    out = df.copy()
+
+    # Normalize UTC timestamp first.
+    if "timestamp_utc" in out.columns:
+        ts_utc = pd.to_datetime(out["timestamp_utc"], errors="coerce", utc=True)
+        out["timestamp_utc"] = ts_utc.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    else:
+        ts_utc = pd.Series(pd.NaT, index=out.index)
+
+    if "retrieved_at_utc" in out.columns:
+        ret_utc = pd.to_datetime(out["retrieved_at_utc"], errors="coerce", utc=True)
+        out["retrieved_at_utc"] = ret_utc.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    # JST is display/debug only.
+    if "timestamp_utc" in df.columns:
+        ts_utc_for_jst = pd.to_datetime(df["timestamp_utc"], errors="coerce", utc=True)
+        ts_jst = ts_utc_for_jst.dt.tz_convert("Asia/Tokyo")
+        out["timestamp_jst"] = ts_jst.dt.strftime("%Y-%m-%dT%H:%M:%S.%f%z")
+        out["date_jst"] = ts_jst.dt.strftime("%Y-%m-%d")
+
+    # Ensure list columns are list[str], not mixed scalar/list/NaN.
+    for col in ["topics", "related_rics", "related_rics_lseg"]:
+        if col in out.columns:
+            out[col] = out[col].apply(_safe_list)
+
+    # Avoid pandas NA objects in simple text columns.
+    text_cols = [
+        "story_id",
+        "headline",
+        "source",
+        "language",
+        "query_name",
+        "query_type",
+        "timestamp_source",
+        "story_text",
+    ]
+    for col in text_cols:
+        if col in out.columns:
+            out[col] = out[col].fillna("").astype(str)
+
+    return out
+```
+
+---
+
+## 2. `_normalize_datetime_columns()` は保存用に使わない
+
+前回の `_normalize_datetime_columns()` は内部計算用としては使えますが、今回のエラーが消えていないなら、**保存前は必ず `_make_news_parquet_safe()` を使ってください**。
+
+---
+
+## 3. `fetch_lseg_news()` の最後を修正
+
+既存の `fetch_lseg_news()` の最後がこうなっている場合：
+
+```python
+if news_cfg.get("fetch_stories", True):
+    df["story_text"] = [
+        fetch_story_text(ld, sid)
+        for sid in df["story_id"].astype(str)
+    ]
+else:
+    df["story_text"] = ""
+
+df = _normalize_datetime_columns(df)
+
+return df
+```
+
+以下に変更してください。
+
+```python
+if news_cfg.get("fetch_stories", True):
+    df["story_text"] = [
+        fetch_story_text(ld, sid)
+        for sid in df["story_id"].astype(str)
+    ]
+else:
+    df["story_text"] = ""
+
+# 保存・後続処理で型衝突しないよう、ニュースDFはparquet-safeにする。
+df = _make_news_parquet_safe(df)
+
+return df
+```
+
+---
+
+## 4. `make_mock_news()` の最後も修正
+
+```python
+return _normalize_datetime_columns(pd.DataFrame(rows))
+```
+
+を以下に変更してください。
+
+```python
+return _make_news_parquet_safe(pd.DataFrame(rows))
+```
+
+---
+
+## 5. 保存関数があるなら必ずここで再実行
+
+`to_parquet()` 直前に必ず入れてください。
+
+```python
+news_df = _make_news_parquet_safe(news_df)
+news_df.to_parquet(path, index=False)
+```
+
+保存関数があるなら、こうしてください。
+
+```python
+def save_news_df(news_df: pd.DataFrame, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    safe_df = _make_news_parquet_safe(news_df)
+    safe_df.to_parquet(path, index=False)
+```
+
+---
+
+## 6. 読み込み後に datetime として使う場合
+
+保存時は文字列化しますが、後続の特徴量計算では以下のように戻してください。
+
+```python
+news_df["timestamp_utc"] = pd.to_datetime(
+    news_df["timestamp_utc"],
+    errors="coerce",
+    utc=True,
+)
+
+news_df["date_jst"] = pd.to_datetime(
+    news_df["date_jst"],
+    errors="coerce",
+).dt.strftime("%Y-%m-%d")
+```
+
+`features.py` で日付を作る箇所が `timestamp_utc` を使っているなら、処理の冒頭にこれを入れるのが安全です。
+
+```python
+news_df = news_df.copy()
+news_df["timestamp_utc"] = pd.to_datetime(
+    news_df["timestamp_utc"],
+    errors="coerce",
+    utc=True,
+)
+```
+
+---
+
+## 7. それでも落ちる場合の原因確認コード
+
+`to_parquet()` の直前でこれを実行してください。
+
+```python
+print(news_df.dtypes)
+
+for col in news_df.columns:
+    vals = news_df[col].dropna().head(5).tolist()
+    print(f"\n[{col}] dtype={news_df[col].dtype}")
+    print(vals)
+```
+
+特に見るべき列は以下です。
+
+```text
+timestamp_utc
+timestamp_jst
+retrieved_at_utc
+date_jst
+topics
+related_rics
+related_rics_lseg
+```
+
+`timestamp_utc` がまだ `datetime64[us, utc]` や `datetime64[ns, UTC]` のままなら、保存直前に `_make_news_parquet_safe()` が通っていません。
+
+---
+
+## 8. さらに確実な回避策：pickle fallback
+
+ニュース取得直後の raw 保存は、parquet にこだわらず pickle でもよいです。リスト列や時刻列が混ざる raw news では pickle の方が安全です。
+
+```python
+news_df.to_pickle("data/raw/news/lseg_news_small.pkl")
+```
+
+読み込み：
+
+```python
+news_df = pd.read_pickle("data/raw/news/lseg_news_small.pkl")
+```
+
+小規模検証ではこれが最も安定します。parquet は、`news_clean.parquet` のように列型が完全に固まった後に使うのがよいです。
+
+## Response:
+2026/4/28 1:13:48
+
+ニュース取得を増やすときは、いきなり「全テーマ × 全構成銘柄 × 長期間」にしない方がよいです。  
+推奨は、**期間 → テーマ数 → RIC数 → query種類 → story本文取得**の順に増やすことです。
+
+---
+
+# 1. 基本方針
+
+現在のパイプラインでは、ニュース取得ルートは大きく3つあります。
+
+| 取得ルート | 役割 | 増やす優先度 |
+|---|---|---:|
+| `japan_broad_en` | 日本市場全体の broad news | 中 |
+| `theme_keyword` | テーマ語・政策語・業界語のニュース | 高 |
+| `constituent_ric` | 構成銘柄単位のニュース | 高 |
+| `get_story` 本文取得 | headline から本文取得 | 最後に増やす |
+
+まず増やすべきは、**テーマ数と RIC 数**です。  
+`get_story()` の本文取得は API 負荷と時間が増えやすいので、最初は headline 中心で十分です。
+
+---
+
+# 2. 段階的な拡張プラン
+
+## Phase 0：疎通確認
+
+目的は、LSEG取得・保存・embedding・帰属・スコア計算が動くことの確認です。
+
+```yaml
+news:
+  mode: lseg
+  start: "2026-04-01T00:00:00"
+  end: "2026-04-07T23:59:59"
+  count_per_query: 20
+  fetch_stories: false
+  deduplicate_by_story_id: true
+
+debug:
+  limit_themes: 2
+  max_rics_per_theme: 3
+```
+
+目安：
+
+```text
+期間: 1週間
+テーマ数: 2
+RIC数: 各テーマ3銘柄
+本文取得: なし
+```
+
+確認するもの：
+
+```python
+df["timestamp_source"].value_counts(dropna=False)
+df.groupby("query_type")["story_id"].count()
+df.assign(n_rics=df["related_rics"].apply(len)).groupby("query_type")["n_rics"].describe()
+```
+
+---
+
+## Phase 1：テーマ数を増やす
+
+次に、対象テーマを 5〜10 個へ増やします。  
+まだ期間は短く、本文取得もしません。
+
+```yaml
+news:
+  count_per_query: 30
+  fetch_stories: false
+
+debug:
+  limit_themes: 10
+  max_rics_per_theme: 3
+```
+
+目安：
+
+```text
+期間: 1〜2週間
+テーマ数: 5〜10
+RIC数: 各テーマ3銘柄
+本文取得: なし
+```
+
+この段階では、主に以下を確認します。
+
+| 確認項目 | 見る理由 |
+|---|---|
+| テーマごとのニュース件数 | 取れないテーマがないか |
+| `news_theme_links` の関連度 | 無関係ニュースが混ざっていないか |
+| `ThemeScore` の上位テーマ | 直感的に説明できるか |
+| broad query の混入度 | broad news がノイズになっていないか |
+
+---
+
+## Phase 2：RIC数を増やす
+
+次に、各テーマの RIC 数を増やします。  
+日本株版では Breadth が重要なので、RIC query を増やす価値が高いです。
+
+```yaml
+debug:
+  limit_themes: 10
+  max_rics_per_theme: 10
+```
+
+目安：
+
+```text
+期間: 2週間
+テーマ数: 5〜10
+RIC数: 各テーマ10銘柄
+本文取得: なし
+```
+
+この段階で確認すべきは **Breadth** です。
+
+```python
+theme_features.groupby("theme_id")[[
+    "mentions",
+    "weighted_mentions",
+    "breadth_weight_raw",
+    "breadth_count_raw",
+]].describe()
+```
+
+もし Breadth がほとんどゼロなら、次を疑います。
+
+```text
+1. RIC query がうまくニュースを拾えていない
+2. related_rics が空のまま
+3. RIC query 後の対象 RIC 補完が入っていない
+4. 構成銘柄リストの RIC 表記と LSEG query の RIC 表記がずれている
+```
+
+---
+
+## Phase 3：期間を伸ばす
+
+テーマ数・RIC数を固定したまま、期間を伸ばします。
+
+```yaml
+news:
+  start: "2026-03-01T00:00:00"
+  end: "2026-04-07T23:59:59"
+  count_per_query: 50
+  fetch_stories: false
+```
+
+目安：
+
+```text
+期間: 1〜2か月
+テーマ数: 5〜10
+RIC数: 各テーマ10銘柄
+本文取得: なし
+```
+
+ここで、Buzz の rolling window が意味を持ち始めます。
+
+```yaml
+features:
+  buzz_lookback_days: 40
+```
+
+1週間だけだと Buzz の過去平均が安定しません。  
+**Buzz を見るには最低1〜2か月程度**のニュース履歴が欲しいです。
+
+---
+
+## Phase 4：count_per_query を増やす
+
+期間を伸ばすと、`count_per_query` が小さいままでは取り切れません。
+
+```yaml
+news:
+  count_per_query: 100
+```
+
+ただし、`count_per_query` を増やしても、LSEG 側の `get_headlines()` が単発取得で上限に当たる場合があります。  
+その場合は、**期間を日次・週次に分割して取得**する方が確実です。
+
+---
+
+# 3. 期間分割で取得する
+
+大量取得では、以下のように取得期間を分割するのが安全です。
+
+```text
+2026-03-01〜2026-03-07
+2026-03-08〜2026-03-14
+2026-03-15〜2026-03-21
+...
+```
+
+## 推奨
+
+| 期間 | 分割単位 |
+|---|---|
+| 1週間以内 | 分割不要 |
+| 1〜2か月 | 週次分割 |
+| 3か月以上 | 週次または日次分割 |
+| ニュース量が多い broad query | 日次分割 |
+
+設定例：
+
+```yaml
+news:
+  start: "2026-03-01T00:00:00"
+  end: "2026-04-07T23:59:59"
+  count_per_query: 100
+  split_by: "W"        # D | W | none
+  fetch_stories: false
+```
+
+実装側では、`fetch_lseg_news()` の中で期間を分割して `fetch_headlines()` を繰り返します。
+
+---
+
+# 4. story本文取得は最後に増やす
+
+`fetch_stories: true` にすると、headline ごとに `get_story()` を叩くので急に重くなります。
+
+したがって、段階は以下です。
+
+| 段階 | `fetch_stories` | clean_text |
+|---|---:|---|
+| 初期 | false | headline のみ |
+| 中間 | 一部だけ true | headline + story |
+| 本番候補 | true | headline + story |
+
+おすすめは、まず headline だけで帰属精度を見て、上位関連ニュースだけ本文取得することです。
+
+```yaml
+news:
+  fetch_stories: false
+  fetch_stories_for_top_links: true
+  max_story_fetch: 500
+```
+
+設計としては、
+
+```text
+1. headlineのみ取得
+2. headline embeddingで news-theme link 作成
+3. rel_score 上位ニュースだけ get_story()
+4. story_text を追加
+5. story込み clean_text で再embedding
+```
+
+が効率的です。
+
+---
+
+# 5. broad query は増やしすぎない
+
+`japan_broad_en` は便利ですが、ノイズも増えます。
+
+増やす優先順位は次です。
+
+```text
+1. constituent_ric query
+2. theme_keyword query
+3. japan_broad_en
+```
+
+`japan_broad_en` は、以下のように count を低めに制限してよいです。
+
+```yaml
+news_queries:
+  japan_broad_en:
+    query_type: broad
+    query: "Japan AND Language:LEN AND Source:RTRS"
+    count_per_query: 30
+```
+
+一方、RIC query と theme keyword は多めにしてよいです。
+
+```yaml
+news_queries:
+  by_constituent:
+    template_en: "R:{ric} AND Language:LEN AND Source:RTRS"
+    count_per_query: 100
+```
+
+---
+
+# 6. おすすめ拡張順
+
+実務的には以下がよいです。
+
+```text
+Step 1: 2テーマ × 上位3RIC × 1週間 × headlineのみ
+Step 2: 10テーマ × 上位3RIC × 2週間 × headlineのみ
+Step 3: 10テーマ × 上位10RIC × 1か月 × headlineのみ
+Step 4: 全テーマ × 上位10RIC × 1か月 × headlineのみ
+Step 5: 全テーマ × 上位20RIC × 2〜3か月 × headlineのみ
+Step 6: rel_score上位だけ本文取得
+Step 7: 必要なら全story本文取得
+Step 8: 6〜12か月へ拡張
+```
+
+---
+
+# 7. 取得量を増やすたびに見るべきチェック
+
+## 7.1 query_type 別ニュース件数
+
+```python
+display(
+    news_df.groupby("query_type")
+    .agg(
+        n_news=("story_id", "nunique"),
+        start=("timestamp_utc", "min"),
+        end=("timestamp_utc", "max"),
+    )
+)
+```
+
+## 7.2 query_name 別ニュース件数
+
+```python
+display(
+    news_df.groupby("query_name")
+    .agg(n_news=("story_id", "nunique"))
+    .sort_values("n_news", ascending=False)
+    .head(50)
+)
+```
+
+## 7.3 RIC 充足率
+
+```python
+tmp = news_df.copy()
+tmp["n_related_rics"] = tmp["related_rics"].apply(lambda x: len(x) if isinstance(x, list) else 0)
+
+display(
+    tmp.groupby("query_type")["n_related_rics"].describe()
+)
+```
+
+## 7.4 テーマ別 linked news 件数
+
+```python
+display(
+    links_df.groupby("theme_id")
+    .agg(
+        n_linked_news=("story_id", "nunique"),
+        avg_rel_score=("rel_score", "mean"),
+        max_rel_score=("rel_score", "max"),
+    )
+    .sort_values("n_linked_news", ascending=False)
+)
+```
+
+## 7.5 無関係ニュースの混入確認
+
+```python
+display(
+    links_df.merge(
+        news_df[["story_id", "headline", "query_name", "query_type"]],
+        on="story_id",
+        how="left",
+    )
+    .sort_values("rel_score", ascending=False)
+    .head(50)
+)
+```
+
+---
+
+# 8. config の現実的な段階設定
+
+## 小規模
+
+```yaml
+news:
+  mode: lseg
+  start: "2026-04-01T00:00:00"
+  end: "2026-04-07T23:59:59"
+  count_per_query: 20
+  fetch_stories: false
+  deduplicate_by_story_id: true
+
+debug:
+  limit_themes: 3
+  max_rics_per_theme: 3
+```
+
+## 中規模
+
+```yaml
+news:
+  mode: lseg
+  start: "2026-03-01T00:00:00"
+  end: "2026-04-07T23:59:59"
+  count_per_query: 50
+  fetch_stories: false
+  deduplicate_by_story_id: true
+  split_by: "W"
+
+debug:
+  limit_themes: 10
+  max_rics_per_theme: 10
+```
+
+## 本格検証前
+
+```yaml
+news:
+  mode: lseg
+  start: "2026-01-01T00:00:00"
+  end: "2026-04-07T23:59:59"
+  count_per_query: 100
+  fetch_stories: false
+  deduplicate_by_story_id: true
+  split_by: "W"
+
+debug:
+  limit_themes: null
+  max_rics_per_theme: 20
+```
+
+## 本格検証
+
+```yaml
+news:
+  mode: lseg
+  start: "2025-04-01T00:00:00"
+  end: "2026-04-07T23:59:59"
+  count_per_query: 100
+  fetch_stories: false
+  deduplicate_by_story_id: true
+  split_by: "W"
+
+debug:
+  limit_themes: null
+  max_rics_per_theme: null
+```
+
+---
+
+# 9. 最初は headline だけでもよいか
+
+はい、よいです。
+
+初期段階では、以下の理由で headline だけでも十分です。
+
+| 理由 | 内容 |
+|---|---|
+| API負荷が軽い | `get_story()` を大量に呼ばない |
+| テーマ検出の粗い精度確認に十分 | headline には主要イベント語が入りやすい |
+| ノイズ確認がしやすい | なぜリンクしたか見やすい |
+| 閾値調整に向く | rel_score の挙動確認が速い |
+
+ただし、次のテーマでは story 本文が必要になりやすいです。
+
+| テーマ | 本文が必要な理由 |
+|---|---|
+| 低PBR・資本効率 | headline だけだと資本政策の詳細が出ない |
+| 政策テーマ | 本文に政策対象産業が出ることがある |
+| 複合テーマ | headline だけではテーマ横断性が分かりにくい |
+| 企業名が headline にないニュース | 本文にだけ企業名がある |
+
+---
+
+# 10. 私の推奨設定
+
+次の一手としては、これがよいです。
+
+```yaml
+news:
+  mode: lseg
+  start: "2026-03-01T00:00:00"
+  end: "2026-04-07T23:59:59"
+  count_per_query: 50
+  fetch_stories: false
+  deduplicate_by_story_id: true
+  split_by: "W"
+
+debug:
+  limit_themes: 10
+  max_rics_per_theme: 10
+```
+
+この設定で、**1〜2か月、10テーマ、各テーマ上位10 RIC、headlineのみ**を取り、`news_theme_links_sample.csv` と `theme_news_features_daily.parquet` を確認してください。
+
+問題なければ次に、
+
+```yaml
+debug:
+  limit_themes: null
+  max_rics_per_theme: 20
+```
+
+へ拡張し、最後に `fetch_stories` を部分的に有効化するのが安全です。
+
+## Response:
+2026/4/28 1:18:15
+
+> **Providing step-by-step code guidance for plotting time series**
+>
+> The user is asking for help with plotting a time series of theme scores, andspecifically wants code for it. I'll give them code using matplotlib, without any unnecessary tools or web data. Key detail: if `date_jst` is a string, it needs conversion to datetime first. I'll focus on a stepwise approach and address top N themes. I'll respond in Japanese.
+>
+> Thought for 12s
+
+## Response:
+2026/4/28 1:18:52
+
+以下を `notebooks` または `main.ipynb` の可視化セルに追加してください。  
+入力は `data/processed/theme_news_features_daily.parquet` を想定します。
+
+```python
+from pathlib import Path
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+PROJECT_ROOT = Path.cwd()
+
+features_path = PROJECT_ROOT / "data" / "processed" / "theme_news_features_daily.parquet"
+out_dir = PROJECT_ROOT / "outputs" / "figures"
+out_dir.mkdir(parents=True, exist_ok=True)
+
+features = pd.read_parquet(features_path)
+
+# date列の整形
+features["date"] = pd.to_datetime(features["date"])
+
+# 必須列チェック
+required_cols = {"date", "theme_id", "theme_score"}
+missing = required_cols - set(features.columns)
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+display(features.head())
+display(features[["date", "theme_id", "theme_score"]].describe(include="all"))
+```
+
+---
+
+## 1. 全テーマの ThemeScore 時系列をプロット
+
+テーマ数が少ない場合はこちらで十分です。
+
+```python
+plot_df = (
+    features
+    .pivot_table(
+        index="date",
+        columns="theme_id",
+        values="theme_score",
+        aggfunc="last",
+    )
+    .sort_index()
+)
+
+fig, ax = plt.subplots(figsize=(14, 7))
+
+for col in plot_df.columns:
+    ax.plot(plot_df.index, plot_df[col], label=col, linewidth=1.2)
+
+ax.axhline(0, linestyle="--", linewidth=1)
+ax.set_title("ThemeScore Time Series")
+ax.set_xlabel("Date")
+ax.set_ylabel("ThemeScore")
+ax.legend(loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+out_path = out_dir / "theme_score_timeseries_all.png"
+plt.savefig(out_path, dpi=150, bbox_inches="tight")
+plt.show()
+
+print(f"Saved: {out_path}")
+```
+
+---
+
+## 2. 直近スコア上位テーマだけをプロット
+
+テーマ数が多い場合はこちらが見やすいです。
+
+```python
+top_n = 10
+
+latest_date = features["date"].max()
+
+latest_top_themes = (
+    features.loc[features["date"] == latest_date]
+    .sort_values("theme_score", ascending=False)
+    .head(top_n)["theme_id"]
+    .tolist()
+)
+
+plot_df_top = plot_df[latest_top_themes]
+
+fig, ax = plt.subplots(figsize=(14, 7))
+
+for col in plot_df_top.columns:
+    ax.plot(plot_df_top.index, plot_df_top[col], label=col, linewidth=1.5)
+
+ax.axhline(0, linestyle="--", linewidth=1)
+ax.set_title(f"ThemeScore Time Series: Top {top_n} Themes as of {latest_date.date()}")
+ax.set_xlabel("Date")
+ax.set_ylabel("ThemeScore")
+ax.legend(loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+out_path = out_dir / f"theme_score_timeseries_top{top_n}.png"
+plt.savefig(out_path, dpi=150, bbox_inches="tight")
+plt.show()
+
+print(f"Saved: {out_path}")
+```
+
+---
+
+## 3. 上位4テーマの選択推移をヒートマップで確認
+
+上位4テーマ等ウェイト戦略で、どのテーマが選ばれていたかを確認します。
+
+```python
+top_k = 4
+
+ranked = features.copy()
+ranked["rank"] = ranked.groupby("date")["theme_score"].rank(
+    method="first",
+    ascending=False,
+)
+
+ranked["selected"] = (ranked["rank"] <= top_k).astype(int)
+
+selected_mat = (
+    ranked
+    .pivot_table(
+        index="theme_id",
+        columns="date",
+        values="selected",
+        aggfunc="max",
+        fill_value=0,
+    )
+)
+
+# 選択回数が多い順に並べる
+selected_mat = selected_mat.loc[selected_mat.sum(axis=1).sort_values(ascending=False).index]
+
+fig, ax = plt.subplots(figsize=(16, max(6, 0.3 * len(selected_mat))))
+
+im = ax.imshow(selected_mat.values, aspect="auto", interpolation="nearest")
+
+ax.set_title(f"Selected Top {top_k} Themes Over Time")
+ax.set_xlabel("Date")
+ax.set_ylabel("Theme ID")
+
+# x軸ラベルは間引く
+dates = selected_mat.columns
+step = max(1, len(dates) // 10)
+ax.set_xticks(range(0, len(dates), step))
+ax.set_xticklabels([pd.to_datetime(dates[i]).strftime("%Y-%m-%d") for i in range(0, len(dates), step)], rotation=45, ha="right")
+
+ax.set_yticks(range(len(selected_mat.index)))
+ax.set_yticklabels(selected_mat.index)
+
+plt.colorbar(im, ax=ax, label="Selected")
+plt.tight_layout()
+
+out_path = out_dir / "selected_theme_heatmap.png"
+plt.savefig(out_path, dpi=150, bbox_inches="tight")
+plt.show()
+
+print(f"Saved: {out_path}")
+```
+
+---
+
+## 4. Buzz / Tone / Breadth の分解プロット
+
+特定テーマについて、ThemeScore の内訳を確認します。
+
+```python
+theme_id = latest_top_themes[0]  # 任意のtheme_idに変更
+
+component_cols = ["buzz", "tone", "breadth", "theme_score"]
+missing = set(component_cols) - set(features.columns)
+if missing:
+    raise ValueError(f"Missing component columns: {missing}")
+
+sub = (
+    features.loc[features["theme_id"] == theme_id, ["date"] + component_cols]
+    .sort_values("date")
+)
+
+fig, ax = plt.subplots(figsize=(14, 7))
+
+for col in component_cols:
+    ax.plot(sub["date"], sub[col], label=col, linewidth=1.5)
+
+ax.axhline(0, linestyle="--", linewidth=1)
+ax.set_title(f"ThemeScore Components: {theme_id}")
+ax.set_xlabel("Date")
+ax.set_ylabel("Score / z-score")
+ax.legend(loc="best")
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+out_path = out_dir / f"theme_score_components_{theme_id}.png"
+plt.savefig(out_path, dpi=150, bbox_inches="tight")
+plt.show()
+
+print(f"Saved: {out_path}")
+```
+
+---
+
+## 5. レポート用に最新スコア表も出力
+
+```python
+latest_scores = (
+    features.loc[features["date"] == latest_date]
+    .sort_values("theme_score", ascending=False)
+    [[
+        "date",
+        "theme_id",
+        "theme_score",
+        "buzz",
+        "tone",
+        "breadth",
+        "mentions",
+        "weighted_mentions",
+    ]]
+)
+
+display(latest_scores.head(20))
+
+out_path = PROJECT_ROOT / "outputs" / "tables" / "theme_scores_latest_ranked.csv"
+out_path.parent.mkdir(parents=True, exist_ok=True)
+latest_scores.to_csv(out_path, index=False, encoding="utf-8-sig")
+
+print(f"Saved: {out_path}")
+```
+
+これで、`outputs/figures/` に以下が保存されます。
+
+```text
+theme_score_timeseries_all.png
+theme_score_timeseries_top10.png
+selected_theme_heatmap.png
+theme_score_components_<theme_id>.png
+```
 
 
 
