@@ -2,8 +2,8 @@
 
 **User:** Anonymous  
 **Created:** 4/27/2026 21:10:39  
-**Updated:** 4/28/2026 0:09:31  
-**Exported:** 4/28/2026 0:09:47  
+**Updated:** 4/28/2026 0:21:47  
+**Exported:** 4/28/2026 0:22:08  
 **Link:** [https://chatgpt.com/c/69ef5235-2b90-83a5-bf87-313d55107d05](https://chatgpt.com/c/69ef5235-2b90-83a5-bf87-313d55107d05)  
 
 ## Response:
@@ -7546,6 +7546,594 @@ if news_cfg.get("deduplicate_by_story_id", True):
 ```
 
 ただし、これは「最小修正」から少しだけ外れるので、まずは上の `normalize_headlines_df()` と `query_type` 追加だけで十分です。
+
+## Response:
+2026/4/28 0:20:46
+
+これは **pandas / pyarrow / parquet 保存時に、datetime の精度が `us` と `ns` で混在している**ために出る典型的なエラーです。
+
+特に今回のコードでは、次のような混在が起きやすいです。
+
+```text
+timestamp_utc      datetime64[ns, UTC] または datetime64[us, UTC]
+retrieved_at_utc   Timestamp.now(tz="UTC") 由来
+timestamp_jst      timezone 付き datetime
+```
+
+対処はシンプルで、**`normalize_headlines_df()` の最後で datetime 列をすべて pandas 標準の `datetime64[ns, UTC]` に寄せる**のがよいです。
+
+---
+
+## 1. 最小修正：関数を1つ追加
+
+同じ `news_loader.py` に以下を追加してください。
+
+```python
+def _normalize_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize datetime columns to pandas datetime64[ns, UTC]."""
+    out = df.copy()
+
+    if "timestamp_utc" in out.columns:
+        out["timestamp_utc"] = pd.to_datetime(
+            out["timestamp_utc"],
+            errors="coerce",
+            utc=True,
+        ).astype("datetime64[ns, UTC]")
+
+    if "retrieved_at_utc" in out.columns:
+        out["retrieved_at_utc"] = pd.to_datetime(
+            out["retrieved_at_utc"],
+            errors="coerce",
+            utc=True,
+        ).astype("datetime64[ns, UTC]")
+
+    if "timestamp_jst" in out.columns:
+        # parquet互換性を優先し、JST列もUTC基準から作り直す
+        out["timestamp_jst"] = (
+            pd.to_datetime(out["timestamp_utc"], errors="coerce", utc=True)
+            .dt.tz_convert("Asia/Tokyo")
+        )
+
+    return out
+```
+
+---
+
+## 2. `normalize_headlines_df()` の return 直前に追加
+
+現在の最後がこうなら：
+
+```python
+return norm.drop_duplicates(["story_id", "query_name"]).reset_index(drop=True)
+```
+
+以下に変更してください。
+
+```python
+norm = norm.drop_duplicates(["story_id", "query_name"]).reset_index(drop=True)
+norm = _normalize_datetime_columns(norm)
+return norm
+```
+
+---
+
+## 3. `fetch_lseg_news()` の concat 後にも入れる
+
+`fetch_lseg_news()` では、複数 query の DataFrame を `pd.concat()` しているので、ここでも再度正規化してください。
+
+現在：
+
+```python
+df = pd.concat(frames, ignore_index=True)
+```
+
+直後に追加：
+
+```python
+df = _normalize_datetime_columns(df)
+```
+
+---
+
+## 4. `make_mock_news()` の後にも効かせる
+
+`make_mock_news()` の最後を、
+
+```python
+return pd.DataFrame(rows)
+```
+
+から以下に変更してください。
+
+```python
+return _normalize_datetime_columns(pd.DataFrame(rows))
+```
+
+---
+
+## 5. parquet 保存前にも念押しする
+
+保存直前に以下を入れるとさらに安全です。
+
+```python
+news_df = _normalize_datetime_columns(news_df)
+news_df.to_parquet(path, index=False)
+```
+
+もしこのプロジェクトの保存関数が別にあるなら、その直前で同じ処理を入れてください。
+
+---
+
+## 6. それでも parquet で落ちる場合
+
+`timestamp_jst` の timezone 付き datetime が原因になる場合があります。その場合は、保存用には JST を **文字列** または **timezone-naive** にします。
+
+おすすめは、JSTは日付集計用に `date_jst` を作り、`timestamp_jst` は文字列保存にする方法です。
+
+```python
+def _normalize_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if "timestamp_utc" in out.columns:
+        out["timestamp_utc"] = pd.to_datetime(
+            out["timestamp_utc"],
+            errors="coerce",
+            utc=True,
+        ).astype("datetime64[ns, UTC]")
+
+    if "retrieved_at_utc" in out.columns:
+        out["retrieved_at_utc"] = pd.to_datetime(
+            out["retrieved_at_utc"],
+            errors="coerce",
+            utc=True,
+        ).astype("datetime64[ns, UTC]")
+
+    if "timestamp_utc" in out.columns:
+        ts_jst = out["timestamp_utc"].dt.tz_convert("Asia/Tokyo")
+        out["timestamp_jst"] = ts_jst.astype(str)
+        out["date_jst"] = ts_jst.dt.date.astype(str)
+
+    return out
+```
+
+この形が一番 parquet と相性がよいです。
+
+---
+
+## 7. 推奨する最終形
+
+今回の用途では、以下を推奨します。
+
+```text
+timestamp_utc       datetime64[ns, UTC]  ← 計算用・バックテスト用
+retrieved_at_utc    datetime64[ns, UTC]  ← 監査用
+timestamp_jst       string               ← 表示用
+date_jst            string               ← 日次集計用
+```
+
+つまり、`timestamp_jst` は timezone付きdatetimeとして保存しない方が安全です。
+
+---
+
+## 8. 追加確認コード
+
+修正後にこれを確認してください。
+
+```python
+print(news_df.dtypes)
+
+for col in ["timestamp_utc", "retrieved_at_utc", "timestamp_jst", "date_jst"]:
+    if col in news_df.columns:
+        print(col, news_df[col].dtype)
+```
+
+期待値は以下です。
+
+```text
+timestamp_utc       datetime64[ns, UTC]
+retrieved_at_utc    datetime64[ns, UTC]
+timestamp_jst       object
+date_jst            object
+```
+
+この形なら、`datetime64[us, utc]` と `datetime64[ns]` の衝突はほぼ避けられます。
+
+## Response:
+2026/4/28 0:21:21
+
+> 思考時間: 1 秒
+
+以下を `news_loader.py` にそのまま入れてください。  
+対象は、**datetime 型の `us/ns` 混在エラーを避けるための最小修正版**です。添付コードの既存構成、つまり `normalize_headlines_df()`、`fetch_lseg_news()`、`make_mock_news()` の流れは維持しています。`Pasted code.py`
+
+---
+
+## 1. 追加する関数
+
+`_safe_list()` の後、または `normalize_headlines_df()` の前に追加してください。
+
+```python
+def _normalize_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize datetime columns to avoid pandas / pyarrow dtype conflicts.
+
+    Recommended internal / storage schema:
+    - timestamp_utc: datetime64[ns, UTC]
+    - retrieved_at_utc: datetime64[ns, UTC]
+    - timestamp_jst: string, display/debug use
+    - date_jst: string, daily aggregation key
+
+    This avoids errors caused by mixed datetime64[us, utc] and datetime64[ns].
+    """
+    out = df.copy()
+
+    if "timestamp_utc" in out.columns:
+        out["timestamp_utc"] = pd.to_datetime(
+            out["timestamp_utc"],
+            errors="coerce",
+            utc=True,
+        ).astype("datetime64[ns, UTC]")
+
+    if "retrieved_at_utc" in out.columns:
+        out["retrieved_at_utc"] = pd.to_datetime(
+            out["retrieved_at_utc"],
+            errors="coerce",
+            utc=True,
+        ).astype("datetime64[ns, UTC]")
+
+    if "timestamp_utc" in out.columns:
+        ts_jst = out["timestamp_utc"].dt.tz_convert("Asia/Tokyo")
+
+        # Store JST as string to avoid parquet timezone dtype conflicts.
+        out["timestamp_jst"] = ts_jst.astype(str)
+
+        # Store daily key as string. Convert to datetime later if needed.
+        out["date_jst"] = ts_jst.dt.strftime("%Y-%m-%d")
+
+    return out
+```
+
+---
+
+## 2. `normalize_headlines_df()` のフルコード
+
+既存の `normalize_headlines_df()` を以下で置き換えてください。
+
+```python
+def normalize_headlines_df(
+    df: pd.DataFrame,
+    query_name: str,
+    query_type: str = "unknown",
+) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        empty = pd.DataFrame(columns=[
+            "story_id",
+            "headline",
+            "timestamp_utc",
+            "timestamp_jst",
+            "date_jst",
+            "timestamp_source",
+            "source",
+            "language",
+            "topics",
+            "related_rics",
+            "related_rics_lseg",
+            "query_name",
+            "query_type",
+            "retrieved_at_utc",
+        ])
+        return empty
+
+    out = df.copy()
+
+    story_col = _pick_col(out, [
+        "storyId",
+        "story_id",
+        "StoryId",
+        "Story ID",
+        "storyID",
+    ])
+
+    headline_col = _pick_col(out, [
+        "headline",
+        "Headline",
+        "text",
+        "Text",
+        "storyHeadline",
+    ])
+
+    # versionCreated を第一候補にする
+    time_col = _pick_col(out, [
+        "versionCreated",
+        "firstCreated",
+        "created",
+        "timestamp",
+        "Timestamp",
+        "Date",
+        "date",
+        "Time",
+        "time",
+    ])
+
+    source_col = _pick_col(out, [
+        "source",
+        "Source",
+        "provider",
+    ])
+
+    lang_col = _pick_col(out, [
+        "language",
+        "Language",
+    ])
+
+    topics_col = _pick_col(out, [
+        "topics",
+        "Topics",
+        "topic",
+        "Topic",
+    ])
+
+    rics_col = _pick_col(out, [
+        "related_rics",
+        "relatedRics",
+        "relatedRICs",
+        "Related RICs",
+        "RIC",
+        "rics",
+        "Rics",
+        "subjects",
+        "Subjects",
+    ])
+
+    if story_col is None:
+        raise ValueError(f"Cannot find story id column. columns={list(out.columns)}")
+
+    norm = pd.DataFrame()
+
+    norm["story_id"] = out[story_col].astype(str).str.strip()
+    norm["headline"] = out[headline_col].astype(str) if headline_col else ""
+
+    if time_col:
+        norm["timestamp_utc"] = pd.to_datetime(
+            out[time_col],
+            errors="coerce",
+            utc=True,
+        )
+        norm["timestamp_source"] = time_col
+    else:
+        norm["timestamp_utc"] = pd.NaT
+        norm["timestamp_source"] = "missing"
+
+    norm["retrieved_at_utc"] = pd.Timestamp.now(tz="UTC")
+
+    # 小規模検証用 fallback。
+    # 本番バックテストでは timestamp_source を確認し、
+    # retrieved_at_fallback が多い場合は LSEG timestamp column の再確認を優先する。
+    mask_nat = norm["timestamp_utc"].isna()
+    norm.loc[mask_nat, "timestamp_utc"] = norm.loc[mask_nat, "retrieved_at_utc"]
+    norm.loc[mask_nat, "timestamp_source"] = "retrieved_at_fallback"
+
+    norm["source"] = out[source_col].astype(str) if source_col else ""
+    norm["language"] = out[lang_col].astype(str) if lang_col else ""
+    norm["topics"] = (
+        out[topics_col].apply(_safe_list)
+        if topics_col
+        else [[] for _ in range(len(out))]
+    )
+
+    norm["related_rics_lseg"] = (
+        out[rics_col].apply(_safe_list)
+        if rics_col
+        else [[] for _ in range(len(out))]
+    )
+
+    # 初期状態では LSEG 由来 RIC を related_rics とする。
+    # 後続で企業名一致などから補完する場合は related_rics_final を別途作る。
+    norm["related_rics"] = norm["related_rics_lseg"]
+
+    norm["query_name"] = query_name
+    norm["query_type"] = query_type
+
+    norm = norm[
+        norm["story_id"].notna()
+        & norm["story_id"].astype(str).str.len().gt(0)
+        & norm["story_id"].astype(str).ne("nan")
+    ].copy()
+
+    norm = norm.drop_duplicates(["story_id", "query_name"]).reset_index(drop=True)
+
+    # datetime 型を最後に統一する
+    norm = _normalize_datetime_columns(norm)
+
+    return norm
+```
+
+---
+
+## 3. `fetch_lseg_news()` の修正版
+
+既存の `fetch_lseg_news()` を以下で置き換えてください。  
+変更点は、`query_type` の付与、concat 後の datetime 正規化、RIC query での RIC 補完です。
+
+```python
+def fetch_lseg_news(cfg: dict, queries: dict, theme_profiles: pd.DataFrame) -> pd.DataFrame:
+    ld = open_lseg_session()
+    news_cfg = cfg["news"]
+    frames: list[pd.DataFrame] = []
+
+    start = news_cfg["start"]
+    end = news_cfg["end"]
+    count = int(news_cfg["count_per_query"])
+
+    # Broad / explicitly configured queries.
+    for qname, qdef in (queries.get("news_queries") or {}).items():
+        if qname in {"settings", "by_constituent"}:
+            continue
+
+        if isinstance(qdef, dict) and qdef.get("query"):
+            raw = fetch_headlines(ld, qdef["query"], start, end, count)
+
+            query_type = qdef.get("query_type", "theme_keyword")
+            if qname.startswith("japan_broad"):
+                query_type = "broad"
+
+            frames.append(
+                normalize_headlines_df(
+                    raw,
+                    query_name=qname,
+                    query_type=query_type,
+                )
+            )
+
+    # RIC based queries.
+    templates = ((queries.get("news_queries") or {}).get("by_constituent") or {})
+    template = templates.get("template_en") or "R:{ric} AND Language:LEN AND Source:RTRS"
+
+    rics = sorted({r for vals in theme_profiles["entity_rics"] for r in vals})
+
+    for ric in rics:
+        raw = fetch_headlines(ld, template.format(ric=ric), start, end, count)
+
+        tmp = normalize_headlines_df(
+            raw,
+            query_name=f"ric_{ric}",
+            query_type="constituent_ric",
+        )
+
+        # RIC query の場合は、LSEG側の related_rics が空でも対象RICを補完する。
+        tmp["related_rics"] = tmp["related_rics"].apply(
+            lambda xs: sorted(set(list(xs) + [ric]))
+        )
+
+        if "related_rics_lseg" in tmp.columns:
+            tmp["related_rics_lseg"] = tmp["related_rics_lseg"].apply(
+                lambda xs: sorted(set(list(xs)))
+            )
+
+        frames.append(tmp)
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+
+    # concat 後に再度 datetime 型を統一する
+    df = _normalize_datetime_columns(df)
+
+    if news_cfg.get("deduplicate_by_story_id", True):
+        df = df.drop_duplicates("story_id").reset_index(drop=True)
+
+    if news_cfg.get("fetch_stories", True):
+        df["story_text"] = [
+            fetch_story_text(ld, sid)
+            for sid in df["story_id"].astype(str)
+        ]
+    else:
+        df["story_text"] = ""
+
+    # story_text 追加後も念のため datetime を再統一
+    df = _normalize_datetime_columns(df)
+
+    return df
+```
+
+---
+
+## 4. `make_mock_news()` の修正版
+
+mock を使う場合も dtype 混在を避けるため、最後に `_normalize_datetime_columns()` を通します。
+
+```python
+def make_mock_news(theme_profiles: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    base = pd.Timestamp("2026-04-01", tz="UTC")
+
+    for i, row in theme_profiles.head(8).iterrows():
+        rics = row.get("entity_rics", [])[:3]
+        names_ja = row.get("entity_names_ja", [])[:3]
+        theme_ja = row.get("theme_name_ja") or row.get("theme_name_en")
+
+        text = f"{theme_ja} 関連で受注増と設備投資拡大のニュース。" + " ".join(names_ja)
+
+        rows.append({
+            "story_id": f"MOCK{i:04d}",
+            "headline": f"{theme_ja} 関連銘柄に好材料",
+            "story_text": text,
+            "timestamp_utc": base + pd.Timedelta(days=i),
+            "timestamp_source": "mock",
+            "source": "MOCK",
+            "language": "JA",
+            "topics": [],
+            "related_rics": rics,
+            "related_rics_lseg": rics,
+            "query_name": "mock",
+            "query_type": "mock",
+            "retrieved_at_utc": pd.Timestamp.now(tz="UTC"),
+        })
+
+    return _normalize_datetime_columns(pd.DataFrame(rows))
+```
+
+---
+
+## 5. 保存前の安全処理
+
+`to_parquet()` する直前にも、念のため以下を入れてください。
+
+```python
+news_df = _normalize_datetime_columns(news_df)
+news_df.to_parquet(path, index=False)
+```
+
+もし保存関数があるなら、以下のようにしてください。
+
+```python
+def save_news_df(news_df: pd.DataFrame, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    news_df = _normalize_datetime_columns(news_df)
+    news_df.to_parquet(path, index=False)
+```
+
+---
+
+## 6. 修正後の確認コード
+
+実行後に以下を確認してください。
+
+```python
+print(news_df.dtypes)
+
+for col in ["timestamp_utc", "retrieved_at_utc", "timestamp_jst", "date_jst"]:
+    if col in news_df.columns:
+        print(col, news_df[col].dtype)
+
+display(news_df[[
+    "story_id",
+    "query_name",
+    "query_type",
+    "headline",
+    "timestamp_utc",
+    "timestamp_jst",
+    "date_jst",
+    "timestamp_source",
+    "related_rics",
+]].head(30))
+
+display(news_df["timestamp_source"].value_counts(dropna=False))
+```
+
+期待される dtype は以下です。
+
+```text
+timestamp_utc       datetime64[ns, UTC]
+retrieved_at_utc    datetime64[ns, UTC]
+timestamp_jst       object
+date_jst            object
+```
+
+`timestamp_jst` と `date_jst` を `object`、つまり文字列として保存することで、`datetime64[us, utc]` と `datetime64[ns]` の衝突を避けられます。
 
 
 
