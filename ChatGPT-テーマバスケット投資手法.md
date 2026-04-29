@@ -2,8 +2,8 @@
 
 **User:** Anonymous  
 **Created:** 4/27/2026 21:10:39  
-**Updated:** 4/28/2026 1:19:13  
-**Exported:** 4/28/2026 1:19:19  
+**Updated:** 4/29/2026 23:50:30  
+**Exported:** 4/29/2026 23:52:57  
 **Link:** [https://chatgpt.com/c/69ef5235-2b90-83a5-bf87-313d55107d05](https://chatgpt.com/c/69ef5235-2b90-83a5-bf87-313d55107d05)  
 
 ## Response:
@@ -4718,8 +4718,6 @@ ThemeScore
 ## Response:
 2026/4/27 21:52:59
 
-> 思考時間: 1 秒
-
 以下は、既存の2つの入力データから、提案手法で使う **テーマプロファイル YAML** を ChatGPT / Codex / LLM に作らせるための指示書です。
 
 目的は、単なる説明文の整形ではなく、後続の
@@ -5711,8 +5709,6 @@ RIC、企業名は入力値を尊重してください。
 ## Response:
 2026/4/27 21:58:34
 
-> 思考時間: 1m 2s
-
 指示書をそのまま再利用できる Markdown ファイルとして整形して保存します。内容は前回の全文をベースに、見出し・コードブロック・チェック用プロンプトまで含めます。
 
 作成しました。こちらからダウンロードできます。
@@ -6049,8 +6045,6 @@ debug:
 
 ## Response:
 2026/4/27 23:59:32
-
-> 思考時間: 1 秒
 
 結論から言うと、**`timestamp_utc` が NaT のまま進めるのは避けるべき**です。一方で、**`related_rics` が入っていないニュースがあること自体は問題ありません**。ただし、日本株テーマでは `Breadth` と `EntityOverlap` の精度に効くため、代替処理を入れるべきです。
 
@@ -7210,8 +7204,6 @@ display(headlines["timestamp_source"].value_counts(dropna=False))
 ## Response:
 2026/4/28 0:09:00
 
-> 思考時間: 数秒
-
 添付コードに対しては、**大きな設計変更なし**で以下の最小修正に留めるのがよいです。
 
 修正対象は主に3点です。
@@ -7741,8 +7733,6 @@ date_jst            object
 ## Response:
 2026/4/28 0:21:21
 
-> 思考時間: 1 秒
-
 以下を `news_loader.py` にそのまま入れてください。  
 対象は、**datetime 型の `us/ns` 混在エラーを避けるための最小修正版**です。添付コードの既存構成、つまり `normalize_headlines_df()`、`fetch_lseg_news()`、`make_mock_news()` の流れは維持しています。`Pasted code.py`
 
@@ -8137,8 +8127,6 @@ date_jst            object
 
 ## Response:
 2026/4/28 0:28:17
-
-> 思考時間: 2 ～ 3 秒
 
 まだ消えない場合、原因はおそらく **`normalize_headlines_df()` 内だけではなく、`pd.concat(frames)` 後・`drop_duplicates` 後・`to_parquet()` 直前のどこかで datetime 型が再混在している**ためです。添付コードでは `fetch_lseg_news()` が複数クエリの結果を `pd.concat(frames, ignore_index=True)` で結合し、その後 `drop_duplicates("story_id")`、`story_text` 追加を行う構造なので、**保存直前で強制的に parquet-safe な型へ落とす処理**を入れるのが最も確実です。`Pasted code.py`
 
@@ -9124,6 +9112,4179 @@ theme_score_timeseries_all.png
 theme_score_timeseries_top10.png
 selected_theme_heatmap.png
 theme_score_components_<theme_id>.png
+```
+
+## Response:
+2026/4/29 22:08:56
+
+RIC単位取得を主軸にすると、テーマ数×銘柄数×期間で取得量が爆発します。ここでは「Broad取得を主軸にして、テーマ/収益ドライバーで絞る」設計に組み替えます。
+
+はい。**RIC単位取得を主軸にする設計は、テーマ数・銘柄数が増えるとすぐに破綻しやすい**です。日本株テーマバスケットの場合は、以下のように再設計するのがよいです。
+
+結論は、**「Broadニュース取得 → テーマプロファイル/収益ドライバーとの意味類似で候補化 → テーマ別ニュース特徴量化 → 必要な場合だけRICで補強」**です。RICニュースは主エンジンではなく、**Breadth検証・代表銘柄確認・個別企業イベント補足**に限定します。
+
+---
+
+# 1. 問題意識：RIC取得を主軸にしない方がよい理由
+
+RIC単位ニュース取得は、次の構造で取得数が膨らみます。
+
+```text
+取得件数 ≒ テーマ数 × テーマ内銘柄数 × 期間分割数 × count_per_query
+```
+
+たとえば、
+
+```text
+50テーマ × 各30銘柄 × 週次52期間 × 100件
+= 7,800,000 headline取得枠
+```
+
+となり、実務的には重すぎます。
+
+さらに、RICニュースは「個別銘柄材料」に寄りやすく、**テーマ全体の盛り上がり**を測るには必ずしも効率的ではありません。むしろ、MSCI のテーマローテーション型手法のように、テーマごとの business description をもとにメディア上の investor attention / sentiment を測る設計の方が、今回の目的に近いです。MSCI の World Thematic Rotation Select Index は、MediaStats Megatrend Scores というテーマ別メディアセンチメントスコアで上位テーマを選択する設計です。([MSCI](https://www.msci.com/indexes/index/752499?utm_source=chatgpt.com)) また、日本版の MSCI Japan Select Thematic Sentiment Rotation Index の methodology でも、各 eligible index の business descriptions を使って、メディア記事から投資家の注目・センチメントの時系列および横断面変化を捉えると説明されています。([MSCI](https://www.msci.com/documents/10199/2b3c6286-98be-3932-79a5-e76436bf0bfc?utm_source=chatgpt.com))
+
+---
+
+# 2. 推奨する取得思想
+
+## 旧設計
+
+```text
+構成銘柄RICごとにニュース取得
+  ↓
+企業ニュースをテーマへ集約
+  ↓
+Buzz / Tone / Breadth
+```
+
+## 新設計
+
+```text
+Broadニュース取得
+  ↓
+テーマプロファイル・収益ドライバーとの意味類似
+  ↓
+テーマ候補ニュースを抽出
+  ↓
+Buzz / Tone / Driver-Breadth / Entity-Breadth
+  ↓
+必要なテーマだけRIC補強
+```
+
+つまり、**ニュース取得の段階では広く取り、分類の段階でテーマに落とす**設計にします。
+
+これは学術的にも自然です。Bybee, Kelly, Manela, Xiu は大量の business news を topic model で解釈可能な topical themes に要約し、各テーマへの news attention の配分を時系列化しています。彼らの研究では、ニュース注目度が経済活動をよく追跡し、株式市場リターン予測にも関係することが示されています。([Wiley Online Library](https://onlinelibrary.wiley.com/doi/full/10.1111/jofi.13377?utm_source=chatgpt.com))
+
+---
+
+# 3. Broad取得の現実的な設計
+
+## 3.1 取得クエリの基本形
+
+RICではなく、以下の4系統でニュースを取得します。
+
+| 取得ルート | 目的 | 例 |
+|---|---|---|
+| Japan market broad | 日本市場全体の材料 | Japan, Japanese equities, TOPIX, Nikkei |
+| Macro / policy broad | 金利・為替・政策 | BOJ, yen, rates, fiscal policy, regulation |
+| Industry broad | 産業テーマ | semiconductor, defense, data center, power grid |
+| Style / event broad | 低PBR・還元・M&A | buyback, dividend, governance, activist |
+
+`lseg.data` の `get_headlines()` は query、count、start、end などを指定してニュースヘッドラインを取得する関数として提供されており、クエリ文字列を使った取得が可能です。([developers.lseg.com](https://developers.lseg.com/en/article-catalog/article/lseg-data-library-for-python--news-pagination?utm_source=chatgpt.com)) また、LSEG の公式サンプルでは `get_headlines()` と `get_story()` を使ったニュース取得フローが示されています。([GitHub](https://github.com/LSEG-API-Samples/Example.DataLibrary.Python/blob/lseg-data-examples/Examples/1-Access/EX-1.01.05-News.ipynb?utm_source=chatgpt.com))
+
+---
+
+## 3.2 `lseg_queries.yaml` の再設計例
+
+```yaml
+news_queries:
+  settings:
+    count_per_query: 100
+    split_by: W
+    fetch_stories: false
+
+  japan_market_broad_en:
+    query_type: broad_market
+    query: >
+      (Japan OR Japanese OR Nikkei OR TOPIX)
+      AND Language:LEN
+      AND Source:RTRS
+
+  japan_macro_policy_en:
+    query_type: broad_macro_policy
+    query: >
+      (Japan OR Japanese OR BOJ OR Bank of Japan OR yen OR JGB OR fiscal policy
+      OR regulation OR subsidy OR government spending)
+      AND Language:LEN
+      AND Source:RTRS
+
+  japan_industry_broad_en:
+    query_type: broad_industry
+    query: >
+      (Japan OR Japanese)
+      AND (semiconductor OR chip OR data center OR power grid OR defense
+      OR automation OR robotics OR healthcare OR drug OR battery OR energy)
+      AND Language:LEN
+      AND Source:RTRS
+
+  japan_style_event_broad_en:
+    query_type: broad_style_event
+    query: >
+      (Japan OR Japanese)
+      AND (share buyback OR dividend OR capital efficiency OR governance reform
+      OR activist OR price-to-book OR PBR OR M&A OR tender offer)
+      AND Language:LEN
+      AND Source:RTRS
+```
+
+ポイントは、**Broadを1本にしない**ことです。1本の `Japan AND Source:RTRS` だけだと、政治・為替・指数・決算が混ざりすぎます。Broad取得は最低でも、**market / macro-policy / industry / style-event** に分けるべきです。
+
+---
+
+# 4. 収益ドライバー定義への拡張
+
+今回のテーマプロファイルには、すでに `revenue_drivers_en/ja`、`catalysts_en/ja`、`positive_events`、`negative_events` が入っています。これを単なる説明情報ではなく、**ニュース取得・分類・スコアリングの中心概念**に昇格させます。
+
+---
+
+## 4.1 テーマ単位ではなく「ドライバー単位」で embedding を作る
+
+現行：
+
+```text
+theme_id → embedding_text
+```
+
+拡張：
+
+```text
+theme_id
+  ├─ theme_embedding
+  ├─ driver_embedding_1
+  ├─ driver_embedding_2
+  ├─ driver_embedding_3
+  ├─ catalyst_embedding
+  └─ event_embedding
+```
+
+たとえば「半導体製造装置」テーマなら、
+
+```text
+theme: semiconductor_equipment_jp
+drivers:
+  - 半導体設備投資サイクル
+  - AI半導体需要
+  - メモリ市況回復
+  - ファウンドリー投資
+  - 輸出規制
+```
+
+それぞれを別々に embedding 化します。
+
+---
+
+## 4.2 ニュース関連度を driver 経由で定義する
+
+従来：
+
+$$
+Rel_{d,k}
+=
+0.45 \cdot Sim(news_d, theme_k)
++
+0.35 \cdot EntityOverlap
++
+0.20 \cdot KeywordMatch
+$$
+
+新設計：
+
+$$
+Rel_{d,k}
+=
+\max_{m \in Drivers(k)}
+Sim(news_d, driver_{k,m})
+$$
+
+または、
+
+$$
+Rel_{d,k}
+=
+\alpha \cdot Sim(news_d, theme_k)
++
+\beta \cdot \max_{m \in Drivers(k)} Sim(news_d, driver_{k,m})
++
+\gamma \cdot KeywordMatch_{d,k}
++
+\delta \cdot EntityMatch_{d,k}
+$$
+
+Broad取得中心では RIC が少ないため、初期値は以下がよいです。
+
+```yaml
+linking:
+  weights_by_query_type:
+    broad_market:
+      theme_embedding: 0.30
+      driver_embedding: 0.45
+      keyword: 0.20
+      entity: 0.05
+
+    broad_macro_policy:
+      theme_embedding: 0.20
+      driver_embedding: 0.50
+      keyword: 0.25
+      entity: 0.05
+
+    broad_industry:
+      theme_embedding: 0.25
+      driver_embedding: 0.50
+      keyword: 0.20
+      entity: 0.05
+
+    broad_style_event:
+      theme_embedding: 0.20
+      driver_embedding: 0.45
+      keyword: 0.30
+      entity: 0.05
+
+    constituent_ric:
+      theme_embedding: 0.20
+      driver_embedding: 0.20
+      keyword: 0.10
+      entity: 0.50
+```
+
+これにより、ニュース本文にテーマ名が出なくても、**収益ドライバーに近いニュース**を拾えます。
+
+SBERT は文や文書を意味ベクトルに変換し、cosine similarity で効率的に比較するために提案された手法で、通常の BERT に比べて大規模な意味検索に適しています。([arXiv](https://arxiv.org/abs/1908.10084?utm_source=chatgpt.com)) したがって、Broadニュースを大量取得し、テーマ/ドライバーとの類似度で振り分ける設計と相性がよいです。
+
+---
+
+# 5. Driver-Breadth を追加する
+
+RIC取得を減らすと、従来の `Breadth = 何銘柄にニュースが広がったか` は弱くなります。そこで、Broad中心設計では **Driver-Breadth** を導入します。
+
+## 5.1 Entity-Breadth
+
+従来のBreadthです。
+
+$$
+EntityBreadth_{k,t}
+=
+\sum_{i \in k} w_{i,k}
+\cdot
+1(i \text{ がニュースに登場})
+$$
+
+RICや企業名が取れるニュースにのみ使います。
+
+## 5.2 Driver-Breadth
+
+新設計です。
+
+$$
+DriverBreadth_{k,t}
+=
+\frac{
+\#\{m \in Drivers(k): NewsAttention_{k,m,t} > \theta_m\}
+}{
+\# Drivers(k)
+}
+$$
+
+たとえば半導体製造装置テーマで、
+
+```text
+AI半導体需要        反応あり
+ファウンドリー投資  反応あり
+メモリ市況          反応なし
+輸出規制            反応あり
+```
+
+なら、
+
+$$
+DriverBreadth = 3/4
+$$
+
+です。
+
+この方が「テーマ全体が広がっているか」をRICなしでも測れます。
+
+---
+
+# 6. 新しいテーマスコア
+
+Broad中心にする場合、テーマスコアは以下がよいです。
+
+$$
+ThemeScore_{k,t}
+=
+0.30 \cdot Buzz_{k,t}
++
+0.20 \cdot Tone_{k,t}
++
+0.25 \cdot DriverBreadth_{k,t}
++
+0.15 \cdot EntityBreadth_{k,t}
++
+0.10 \cdot Novelty_{k,t}
+$$
+
+初期実装で Novelty を入れないなら、
+
+$$
+ThemeScore_{k,t}
+=
+0.35 \cdot Buzz_{k,t}
++
+0.25 \cdot Tone_{k,t}
++
+0.30 \cdot DriverBreadth_{k,t}
++
+0.10 \cdot EntityBreadth_{k,t}
+$$
+
+がよいです。
+
+旧設計：
+
+```text
+ThemeScore = 0.35 Buzz + 0.25 Tone + 0.40 EntityBreadth
+```
+
+新設計：
+
+```text
+ThemeScore = 0.35 Buzz + 0.25 Tone + 0.30 DriverBreadth + 0.10 EntityBreadth
+```
+
+RIC取得を減らすため、**EntityBreadth の比重を下げ、DriverBreadth を主役にする**のがポイントです。
+
+---
+
+# 7. Broad取得中心の実装フロー
+
+## Step 1：Broadニュースを取得
+
+```text
+japan_market_broad_en
+japan_macro_policy_en
+japan_industry_broad_en
+japan_style_event_broad_en
+```
+
+まずは headline だけでよいです。
+
+## Step 2：ニュース embedding
+
+```text
+headline + story_text
+```
+
+ただし初期は headline だけでもよいです。
+
+## Step 3：テーマ/ドライバー embedding
+
+`theme_profiles.yaml` から以下を作ります。
+
+```text
+theme_embedding_text
+driver_embedding_texts
+keyword_match_terms
+positive/negative events
+entity terms
+```
+
+## Step 4：news × driver 類似度
+
+```text
+news_id, theme_id, driver_id, driver_sim
+```
+
+を作ります。
+
+## Step 5：driver経由で theme link を作る
+
+```text
+theme_rel_score = max(driver_sim) + theme_sim + keyword
+```
+
+## Step 6：特徴量作成
+
+```text
+Buzz
+Tone
+DriverBreadth
+EntityBreadth
+ThemeScore
+```
+
+## Step 7：Top4等ウェイト
+
+従来通りです。
+
+---
+
+# 8. 実装上のデータ構造
+
+## 8.1 `theme_driver_profiles.parquet`
+
+```text
+theme_id
+driver_id
+driver_name_en
+driver_name_ja
+driver_text_en
+driver_text_ja
+driver_embedding_text
+driver_type
+```
+
+`driver_type` は以下のようにします。
+
+```text
+revenue_driver
+macro_factor
+policy_factor
+positive_event
+negative_event
+catalyst
+```
+
+ただし初期は `revenue_driver` と `catalyst` だけで十分です。
+
+---
+
+## 8.2 `news_driver_links.parquet`
+
+```text
+story_id
+date_jst
+theme_id
+driver_id
+driver_type
+driver_sim
+keyword_score
+tone
+query_type
+headline
+```
+
+---
+
+## 8.3 `theme_news_links.parquet`
+
+driver link を theme 単位に集約します。
+
+```text
+story_id
+date_jst
+theme_id
+theme_sim
+max_driver_sim
+avg_top_driver_sim
+keyword_score
+entity_score
+rel_score
+matched_driver_ids
+matched_driver_names_ja
+headline
+```
+
+---
+
+# 9. Broad query のノイズ制御
+
+Broad取得はノイズが増えます。そのため、2段階フィルタにしてください。
+
+## 9.1 第一段階：低コストフィルタ
+
+headlineだけで、
+
+```text
+embedding similarity
+keyword match
+query_type
+language/source
+```
+
+を使い、候補ニュースを絞ります。
+
+例：
+
+```python
+candidate = (
+    (max_driver_sim >= 0.50)
+    | (theme_sim >= 0.55)
+    | ((keyword_score >= 0.20) & (max_driver_sim >= 0.40))
+)
+```
+
+## 9.2 第二段階：本文取得
+
+候補ニュースだけ `get_story()` します。
+
+```text
+全headline取得
+  ↓
+headline embeddingで候補化
+  ↓
+候補だけget_story
+  ↓
+本文込みembeddingで再分類
+```
+
+これにより、`get_story()` の呼び出し数を大幅に抑えられます。
+
+---
+
+# 10. 実務的な取得量の推奨
+
+RIC取得を主軸から外す場合、取得量は以下で十分です。
+
+## 初期検証
+
+```yaml
+news:
+  fetch_stories: false
+  split_by: W
+  count_per_query: 100
+
+queries:
+  - japan_market_broad_en
+  - japan_macro_policy_en
+  - japan_industry_broad_en
+  - japan_style_event_broad_en
+```
+
+## 中規模検証
+
+```yaml
+news:
+  fetch_stories: false
+  split_by: D
+  count_per_query: 100
+
+candidate_story_fetch:
+  enabled: true
+  max_story_fetch_per_day: 100
+  min_rel_score_headline: 0.55
+```
+
+## RIC補強
+
+RICは全銘柄ではなく、以下だけに限定します。
+
+| 対象 | 理由 |
+|---|---|
+| 各テーマ上位5〜10銘柄 | 代表銘柄の確認 |
+| ThemeScore上位テーマの構成銘柄 | 選ばれたテーマの検証 |
+| DriverBreadthが高いがEntityBreadthがゼロのテーマ | 企業レベル波及の確認 |
+| 大型イベント日だけ | ニュース解釈の補強 |
+
+---
+
+# 11. 学術・実務根拠の整理
+
+| 根拠 | 示唆 | 今回の設計への反映 |
+|---|---|---|
+| MSCI Thematic Rotation / MediaStats | テーマ別 media sentiment / attention でテーマを選ぶ | RIC集約ではなくテーマ記述ベースでニュースを分類 |
+| MSCI Japan Select Thematic Sentiment Rotation | index business descriptions からメディア記事を分析 | theme profile / driver profile を分類軸にする |
+| Bybee et al. Business News and Business Cycles | 大量ニュースを topical themes に集約し、attention share を時系列化 | Broadニュース取得 → topic/theme attention |
+| SBERT | 大量文書と説明文の意味類似検索に適する | news × theme/driver embedding |
+| BERTopic | Transformer embedding + c-TF-IDF で解釈可能トピックを抽出 | 未分類Broadニュースから新規driver候補を発見 |
+
+BERTopic は、Transformer embedding と c-TF-IDF によって解釈可能な topic representation を作る手法です。([arXiv](https://arxiv.org/abs/2203.05794?utm_source=chatgpt.com)) 初期実装には必須ではありませんが、Broad取得で既存テーマに帰属しないニュースが増えた段階で、未分類ニュースから新しいドライバーや新興テーマを見つける用途に使えます。
+
+---
+
+# 12. 具体的な提案：次に実装すべき拡張
+
+## Phase A：RIC取得を縮小
+
+```yaml
+ric_queries:
+  enabled: true
+  max_rics_per_theme: 5
+  only_for_selected_themes: false
+```
+
+全銘柄ではなく、上位5銘柄だけにします。
+
+---
+
+## Phase B：Broad query を4本に分ける
+
+```yaml
+broad_queries:
+  - japan_market_broad_en
+  - japan_macro_policy_en
+  - japan_industry_broad_en
+  - japan_style_event_broad_en
+```
+
+---
+
+## Phase C：Driver profile を作る
+
+`theme_profiles.yaml` から自動生成します。
+
+```python
+drivers = []
+for theme in themes:
+    for i, x in enumerate(theme["revenue_drivers_ja"]):
+        drivers.append({
+            "theme_id": theme["theme_id"],
+            "driver_id": f"{theme['theme_id']}__revenue_driver_{i:02d}",
+            "driver_type": "revenue_driver",
+            "driver_text": x,
+        })
+```
+
+英語・日本語を結合します。
+
+```text
+driver_text =
+driver_ja + "\n" + driver_en + "\n" + related catalysts
+```
+
+---
+
+## Phase D：ThemeScore を差し替え
+
+```text
+旧:
+ThemeScore = 0.35 Buzz + 0.25 Tone + 0.40 Breadth
+
+新:
+ThemeScore = 0.35 Buzz + 0.25 Tone + 0.30 DriverBreadth + 0.10 EntityBreadth
+```
+
+---
+
+# 13. 最終推奨アーキテクチャ
+
+```text
+Broad LSEG News
+  ├─ Japan market broad
+  ├─ Macro/policy broad
+  ├─ Industry broad
+  └─ Style/event broad
+        ↓
+Headline embedding
+        ↓
+Theme profile similarity
+        ↓
+Revenue driver similarity
+        ↓
+Keyword/event match
+        ↓
+Candidate theme-news links
+        ↓
+Optional story fetch for high-score candidates
+        ↓
+Re-score with full story text
+        ↓
+Buzz
+Tone
+DriverBreadth
+EntityBreadth
+        ↓
+ThemeScore
+        ↓
+Top4 equal weight
+        ↓
+Selected theme only: optional RIC news validation
+```
+
+---
+
+# 14. 実務上の結論
+
+RICニュース取得は、**主エンジンではなく検証・補強用**にするべきです。
+
+推奨は以下です。
+
+```text
+1. Broad query で日本市場・政策・産業・スタイルイベントを広く取得
+2. テーマプロファイルではなく、収益ドライバー単位の embedding を作る
+3. ニュースを driver 経由でテーマに帰属させる
+4. Breadth は EntityBreadth から DriverBreadth 中心に変更する
+5. RIC取得は上位テーマ・上位構成銘柄・検証用途に限定する
+```
+
+これにより、ニュース取得量を抑えつつ、**「テーマ全体がニュース上で盛り上がっているか」**をより直接的に測れます。特に、低PBR、地銀、半導体、電力インフラ、防衛のような日本株テーマでは、個別RICニュースの総和よりも、**収益ドライバーのニュース上の広がり**を見る方が、テーマローテーションのシグナルとして安定しやすいです。
+
+---
+
+**Sources:**
+
+- [MSCI World Thematic Rotation Select Index](https://www.msci.com/indexes/index/752499?utm_source=chatgpt.com)
+- [Business News and Business Cycles - BYBEE - 2024](https://onlinelibrary.wiley.com/doi/full/10.1111/jofi.13377?utm_source=chatgpt.com)
+- [LSEG Data Library for Python: News Pagination | Devportal](https://developers.lseg.com/en/article-catalog/article/lseg-data-library-for-python--news-pagination?utm_source=chatgpt.com)
+- [EX-1.01.05-News.ipynb](https://github.com/LSEG-API-Samples/Example.DataLibrary.Python/blob/lseg-data-examples/Examples/1-Access/EX-1.01.05-News.ipynb?utm_source=chatgpt.com)
+- [Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks](https://arxiv.org/abs/1908.10084?utm_source=chatgpt.com)
+
+## Response:
+2026/4/29 22:22:18
+
+以下では、新提案手法を **Codex で再現実装できる粒度**で整理します。  
+前回までの RIC 主導型から、今回は **Broad ニュース取得 + 収益ドライバー単位のテーマ帰属**に設計を組み替えます。
+
+---
+
+# 1. 新手法のコンセプト
+
+## 旧手法
+
+```text
+構成銘柄RICごとにニュース取得
+  ↓
+ニュースをテーマへ集約
+  ↓
+Buzz / Tone / Breadth
+  ↓
+ThemeScore
+  ↓
+上位4テーマ等ウェイト
+```
+
+この方式は、テーマ数・銘柄数が増えると取得ニュース数が膨大になります。
+
+---
+
+## 新手法
+
+```text
+Broadニュース取得
+  ↓
+ニュース本文・headline embedding
+  ↓
+テーマプロファイル embedding
+  ↓
+収益ドライバー embedding
+  ↓
+ニュースを driver 経由でテーマへ多ラベル帰属
+  ↓
+Buzz / Tone / DriverBreadth / EntityBreadth
+  ↓
+ThemeScore
+  ↓
+上位4テーマ等ウェイト
+```
+
+ポイントは、**ニュースを個別銘柄 RIC で拾うのではなく、テーマの収益ドライバーで拾う**ことです。
+
+たとえば、半導体製造装置テーマなら、ニュース本文に「東京エレクトロン」や特定 RIC がなくても、
+
+```text
+AI semiconductor capex
+memory cycle recovery
+foundry investment
+export controls
+semiconductor equipment orders
+```
+
+のような収益ドライバーに近いニュースであれば、テーマ関連ニュースとして捕捉します。
+
+---
+
+# 2. 実装上の最終パイプライン
+
+```text
+Step 0: テーマプロファイル YAML を読み込む
+
+Step 1: Broad LSEG News 取得
+  - japan_market_broad_en
+  - japan_macro_policy_en
+  - japan_industry_broad_en
+  - japan_style_event_broad_en
+
+Step 2: ニュース前処理
+  - headline
+  - story_text
+  - clean_text
+  - timestamp_utc
+  - date_jst
+  - query_type
+
+Step 3: テーマプロファイル作成
+  - theme embedding text
+  - driver embedding texts
+  - keyword terms
+  - entity terms
+
+Step 4: embedding 作成
+  - news embedding
+  - theme embedding
+  - driver embedding
+
+Step 5: news × theme 類似度
+  - theme_sim
+
+Step 6: news × driver 類似度
+  - driver_sim
+  - max_driver_sim
+  - matched_driver_ids
+
+Step 7: news → theme 多ラベル帰属
+  - rel_score
+
+Step 8: 日次特徴量
+  - Buzz
+  - Tone
+  - DriverBreadth
+  - EntityBreadth
+
+Step 9: ThemeScore
+  - 0.35 Buzz
+  - 0.25 Tone
+  - 0.30 DriverBreadth
+  - 0.10 EntityBreadth
+
+Step 10: 上位4テーマ等ウェイト
+```
+
+---
+
+# 3. データ構造
+
+## 3.1 入力：`configs/theme_profiles.yaml`
+
+既に作成済みのテーマプロファイルを使います。
+
+最低限、以下の項目が必要です。
+
+```yaml
+themes:
+  - theme_id: semiconductor_equipment_jp
+    theme_name_en: Japanese Semiconductor Equipment
+    theme_name_ja: 半導体製造装置
+    theme_type: industry_theme
+
+    description_en: >
+      Japanese semiconductor equipment companies exposed to wafer fabrication
+      equipment demand, AI semiconductor capex, memory cycle, foundry investment,
+      and export controls.
+
+    description_ja: >
+      半導体製造装置、検査装置、AI半導体設備投資、メモリ市況、
+      ファウンドリー投資、輸出規制の影響を受ける日本株テーマ。
+
+    revenue_drivers_en:
+      - semiconductor capital expenditure cycle
+      - AI semiconductor demand
+      - memory cycle recovery
+      - foundry investment
+      - semiconductor equipment orders
+
+    revenue_drivers_ja:
+      - 半導体設備投資サイクル
+      - AI半導体需要
+      - メモリ市況回復
+      - ファウンドリー投資
+      - 半導体製造装置受注
+
+    catalysts_en:
+      - semiconductor equipment
+      - chip equipment
+      - AI semiconductor
+      - memory recovery
+      - foundry capex
+      - export controls
+
+    catalysts_ja:
+      - 半導体製造装置
+      - AI半導体
+      - メモリ市況
+      - ファウンドリー
+      - 設備投資
+      - 輸出規制
+
+    positive_events_en:
+      - order increase
+      - capex increase
+      - upward guidance
+      - memory price recovery
+
+    positive_events_ja:
+      - 受注増加
+      - 設備投資増額
+      - 上方修正
+      - メモリ価格回復
+
+    negative_events_en:
+      - export restrictions
+      - order decline
+      - capex delay
+      - guidance cut
+
+    negative_events_ja:
+      - 輸出規制
+      - 受注減少
+      - 設備投資延期
+      - 下方修正
+
+    entity_linking_terms:
+      rics:
+        - 8035.T
+        - 6857.T
+      company_names_en:
+        - Tokyo Electron
+        - Advantest
+      company_names_ja:
+        - 東京エレクトロン
+        - アドバンテスト
+```
+
+---
+
+## 3.2 中間出力：`theme_driver_profiles.parquet`
+
+テーマごとの収益ドライバーを縦持ちに展開します。
+
+```text
+theme_id
+driver_id
+driver_type
+driver_name_en
+driver_name_ja
+driver_text_en
+driver_text_ja
+driver_embedding_text
+```
+
+例：
+
+```text
+theme_id: semiconductor_equipment_jp
+driver_id: semiconductor_equipment_jp__revenue_driver_000
+driver_type: revenue_driver
+driver_name_en: AI semiconductor demand
+driver_name_ja: AI半導体需要
+driver_embedding_text:
+  AI semiconductor demand
+  AI半導体需要
+  Related theme: Japanese Semiconductor Equipment / 半導体製造装置
+  Related catalysts: AI semiconductor, semiconductor equipment, foundry capex, 半導体製造装置, 設備投資
+```
+
+---
+
+## 3.3 中間出力：`news_driver_links.parquet`
+
+ニュースとドライバーの対応表です。
+
+```text
+story_id
+date_jst
+query_type
+theme_id
+driver_id
+driver_type
+driver_sim
+headline
+```
+
+---
+
+## 3.4 中間出力：`news_theme_links.parquet`
+
+ニュースとテーマの最終対応表です。
+
+```text
+story_id
+date_jst
+theme_id
+theme_sim
+max_driver_sim
+avg_top_driver_sim
+keyword_score
+entity_score
+rel_score
+matched_driver_ids
+matched_driver_names_ja
+tone
+headline
+query_type
+```
+
+---
+
+## 3.5 出力：`theme_news_features_daily.parquet`
+
+```text
+date
+theme_id
+mentions
+weighted_mentions
+buzz_raw
+buzz
+tone_raw
+tone
+driver_breadth_raw
+driver_breadth
+entity_breadth_raw
+entity_breadth
+theme_score
+```
+
+---
+
+# 4. Broad ニュース取得設計
+
+## 4.1 `configs/lseg_queries.yaml`
+
+RIC ではなく、まずは Broad query を主軸にします。
+
+```yaml
+news_queries:
+  settings:
+    count_per_query: 100
+    split_by: W
+    fetch_stories: false
+
+  japan_market_broad_en:
+    query_type: broad_market
+    query: >
+      (Japan OR Japanese OR Nikkei OR TOPIX)
+      AND Language:LEN
+      AND Source:RTRS
+
+  japan_macro_policy_en:
+    query_type: broad_macro_policy
+    query: >
+      (Japan OR Japanese OR BOJ OR "Bank of Japan" OR yen OR JGB
+      OR "fiscal policy" OR regulation OR subsidy OR "government spending")
+      AND Language:LEN
+      AND Source:RTRS
+
+  japan_industry_broad_en:
+    query_type: broad_industry
+    query: >
+      (Japan OR Japanese)
+      AND (semiconductor OR chip OR "data center" OR "power grid" OR defense
+      OR automation OR robotics OR healthcare OR drug OR battery OR energy)
+      AND Language:LEN
+      AND Source:RTRS
+
+  japan_style_event_broad_en:
+    query_type: broad_style_event
+    query: >
+      (Japan OR Japanese)
+      AND ("share buyback" OR dividend OR "capital efficiency" OR "governance reform"
+      OR activist OR "price-to-book" OR PBR OR "tender offer" OR M&A)
+      AND Language:LEN
+      AND Source:RTRS
+```
+
+---
+
+## 4.2 RIC query の扱い
+
+RIC query は完全に廃止せず、**補助用途**に落とします。
+
+```yaml
+ric_queries:
+  enabled: true
+  max_rics_per_theme: 5
+  only_for_selected_themes: false
+  template_en: "R:{ric} AND Language:LEN AND Source:RTRS"
+```
+
+初期実装では、各テーマ上位5 RICだけで十分です。
+
+---
+
+# 5. テーマ・ドライバープロファイル作成
+
+## 5.1 `theme_profile.py` に追加する処理
+
+```python
+from __future__ import annotations
+
+import pandas as pd
+
+def build_theme_embedding_text(theme: dict) -> str:
+    parts = [
+        f"Theme name English: {theme.get('theme_name_en', '')}",
+        f"Theme name Japanese: {theme.get('theme_name_ja', '')}",
+        f"Description English: {theme.get('description_en', '')}",
+        f"Description Japanese: {theme.get('description_ja', '')}",
+        "Revenue drivers English: " + "; ".join(theme.get("revenue_drivers_en", [])),
+        "Revenue drivers Japanese: " + "、".join(theme.get("revenue_drivers_ja", [])),
+        "Catalysts English: " + "; ".join(theme.get("catalysts_en", [])),
+        "Catalysts Japanese: " + "、".join(theme.get("catalysts_ja", [])),
+    ]
+    return "\n".join([p for p in parts if p.strip()])
+
+def build_theme_profiles(themes_config: dict) -> pd.DataFrame:
+    rows = []
+
+    for theme in themes_config["themes"]:
+        entity_terms = theme.get("entity_linking_terms", {})
+
+        rows.append({
+            "theme_id": theme["theme_id"],
+            "theme_name_en": theme.get("theme_name_en", ""),
+            "theme_name_ja": theme.get("theme_name_ja", ""),
+            "theme_type": theme.get("theme_type", ""),
+            "embedding_text": theme.get("embedding_text") or build_theme_embedding_text(theme),
+            "keyword_terms_en": theme.get("keyword_match_terms_en", []) or theme.get("catalysts_en", []),
+            "keyword_terms_ja": theme.get("keyword_match_terms_ja", []) or theme.get("catalysts_ja", []),
+            "positive_events_en": theme.get("positive_events_en", []),
+            "positive_events_ja": theme.get("positive_events_ja", []),
+            "negative_events_en": theme.get("negative_events_en", []),
+            "negative_events_ja": theme.get("negative_events_ja", []),
+            "entity_rics": entity_terms.get("rics", []),
+            "entity_names_en": entity_terms.get("company_names_en", []),
+            "entity_names_ja": entity_terms.get("company_names_ja", []),
+        })
+
+    return pd.DataFrame(rows)
+```
+
+---
+
+## 5.2 driver profile 作成
+
+```python
+def build_driver_profiles(themes_config: dict) -> pd.DataFrame:
+    rows = []
+
+    for theme in themes_config["themes"]:
+        theme_id = theme["theme_id"]
+        theme_name_en = theme.get("theme_name_en", "")
+        theme_name_ja = theme.get("theme_name_ja", "")
+
+        catalysts_en = theme.get("catalysts_en", [])
+        catalysts_ja = theme.get("catalysts_ja", [])
+
+        drivers_en = theme.get("revenue_drivers_en", [])
+        drivers_ja = theme.get("revenue_drivers_ja", [])
+
+        max_len = max(len(drivers_en), len(drivers_ja))
+
+        for i in range(max_len):
+            driver_en = drivers_en[i] if i < len(drivers_en) else ""
+            driver_ja = drivers_ja[i] if i < len(drivers_ja) else ""
+
+            driver_text = "\n".join([
+                f"Theme English: {theme_name_en}",
+                f"Theme Japanese: {theme_name_ja}",
+                f"Driver English: {driver_en}",
+                f"Driver Japanese: {driver_ja}",
+                "Related catalysts English: " + "; ".join(catalysts_en[:15]),
+                "Related catalysts Japanese: " + "、".join(catalysts_ja[:15]),
+            ])
+
+            rows.append({
+                "theme_id": theme_id,
+                "driver_id": f"{theme_id}__revenue_driver_{i:03d}",
+                "driver_type": "revenue_driver",
+                "driver_name_en": driver_en,
+                "driver_name_ja": driver_ja,
+                "driver_embedding_text": driver_text,
+            })
+
+        # catalyst も driver-like profile として追加
+        for j, catalyst in enumerate(catalysts_en[:20]):
+            rows.append({
+                "theme_id": theme_id,
+                "driver_id": f"{theme_id}__catalyst_en_{j:03d}",
+                "driver_type": "catalyst",
+                "driver_name_en": catalyst,
+                "driver_name_ja": "",
+                "driver_embedding_text": "\n".join([
+                    f"Theme English: {theme_name_en}",
+                    f"Theme Japanese: {theme_name_ja}",
+                    f"Catalyst English: {catalyst}",
+                ]),
+            })
+
+        for j, catalyst in enumerate(catalysts_ja[:20]):
+            rows.append({
+                "theme_id": theme_id,
+                "driver_id": f"{theme_id}__catalyst_ja_{j:03d}",
+                "driver_type": "catalyst",
+                "driver_name_en": "",
+                "driver_name_ja": catalyst,
+                "driver_embedding_text": "\n".join([
+                    f"Theme English: {theme_name_en}",
+                    f"Theme Japanese: {theme_name_ja}",
+                    f"Catalyst Japanese: {catalyst}",
+                ]),
+            })
+
+    return pd.DataFrame(rows)
+```
+
+初期実装では、`revenue_driver` だけでも構いません。  
+ただし、ニュース本文とのマッチングを強くするには `catalyst` も driver-like profile として持たせる方が有効です。
+
+---
+
+# 6. Embedding 作成
+
+既存の `embeddings.py` を使えます。
+
+```python
+import numpy as np
+import pandas as pd
+
+def load_embedding_model(model_name: str):
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(model_name)
+
+def encode_texts(model, texts: list[str], batch_size: int = 64) -> np.ndarray:
+    return model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        normalize_embeddings=True,
+    )
+
+def cosine_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return a @ b.T
+```
+
+ローカルモデルを使う場合：
+
+```yaml
+embedding:
+  backend: sentence_transformers
+  model_name: data/model/paraphrase-multilingual-MiniLM-L12-v2
+  batch_size: 64
+```
+
+---
+
+# 7. ニュース → テーマ・ドライバー多ラベル帰属
+
+## 7.1 スコア定義
+
+新しい関連度は以下です。
+
+$$
+Rel_{d,k}
+=
+w_T \cdot ThemeSim_{d,k}
++
+w_D \cdot MaxDriverSim_{d,k}
++
+w_K \cdot KeywordScore_{d,k}
++
+w_E \cdot EntityScore_{d,k}
+$$
+
+Broad 中心なので、基本的に `MaxDriverSim` を重視します。
+
+---
+
+## 7.2 query_type 別重み
+
+`config.yaml`：
+
+```yaml
+linking:
+  threshold: 0.50
+
+  weights_by_query_type:
+    broad_market:
+      theme_embedding: 0.30
+      driver_embedding: 0.45
+      keyword: 0.20
+      entity: 0.05
+
+    broad_macro_policy:
+      theme_embedding: 0.20
+      driver_embedding: 0.50
+      keyword: 0.25
+      entity: 0.05
+
+    broad_industry:
+      theme_embedding: 0.25
+      driver_embedding: 0.50
+      keyword: 0.20
+      entity: 0.05
+
+    broad_style_event:
+      theme_embedding: 0.20
+      driver_embedding: 0.45
+      keyword: 0.30
+      entity: 0.05
+
+    constituent_ric:
+      theme_embedding: 0.20
+      driver_embedding: 0.20
+      keyword: 0.10
+      entity: 0.50
+
+    default:
+      theme_embedding: 0.30
+      driver_embedding: 0.45
+      keyword: 0.20
+      entity: 0.05
+```
+
+---
+
+## 7.3 `driver_linker.py`
+
+新規ファイルとして作るのがよいです。
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+def keyword_score(text: str, terms_en: list[str], terms_ja: list[str]) -> float:
+    if not isinstance(text, str):
+        return 0.0
+
+    lower = text.lower()
+    hits = 0
+    total = 0
+
+    for term in terms_en or []:
+        term = str(term).strip()
+        if not term:
+            continue
+        total += 1
+        if term.lower() in lower:
+            hits += 1
+
+    for term in terms_ja or []:
+        term = str(term).strip()
+        if not term:
+            continue
+        total += 1
+        if term in text:
+            hits += 1
+
+    if total == 0:
+        return 0.0
+
+    return min(1.0, hits / max(3.0, total ** 0.5))
+
+def entity_score(text: str, related_rics: list[str], theme_row: pd.Series) -> float:
+    score = 0.0
+
+    theme_rics = set(theme_row.get("entity_rics", []) or [])
+    news_rics = set(related_rics or [])
+
+    if theme_rics and news_rics and theme_rics & news_rics:
+        score = max(score, 1.0)
+
+    lower = text.lower() if isinstance(text, str) else ""
+
+    for name in theme_row.get("entity_names_en", []) or []:
+        if name and str(name).lower() in lower:
+            score = max(score, 1.0)
+
+    for name in theme_row.get("entity_names_ja", []) or []:
+        if name and str(name) in text:
+            score = max(score, 1.0)
+
+    return score
+
+def get_weights(query_type: str, cfg: dict) -> dict:
+    weights_cfg = cfg.get("linking", {}).get("weights_by_query_type", {})
+    return (
+        weights_cfg.get(query_type)
+        or weights_cfg.get("default")
+        or {
+            "theme_embedding": 0.30,
+            "driver_embedding": 0.45,
+            "keyword": 0.20,
+            "entity": 0.05,
+        }
+    )
+
+def build_news_driver_links(
+    news_df: pd.DataFrame,
+    driver_profiles: pd.DataFrame,
+    news_driver_sim: np.ndarray,
+    min_driver_sim: float = 0.45,
+) -> pd.DataFrame:
+    rows = []
+
+    news_reset = news_df.reset_index(drop=True)
+    drivers_reset = driver_profiles.reset_index(drop=True)
+
+    for i, news_row in news_reset.iterrows():
+        for j, drv in drivers_reset.iterrows():
+            sim = float(news_driver_sim[i, j])
+
+            if sim < min_driver_sim:
+                continue
+
+            rows.append({
+                "story_id": news_row["story_id"],
+                "date_jst": news_row.get("date_jst", ""),
+                "query_type": news_row.get("query_type", ""),
+                "theme_id": drv["theme_id"],
+                "driver_id": drv["driver_id"],
+                "driver_type": drv.get("driver_type", ""),
+                "driver_name_en": drv.get("driver_name_en", ""),
+                "driver_name_ja": drv.get("driver_name_ja", ""),
+                "driver_sim": sim,
+                "headline": news_row.get("headline", ""),
+            })
+
+    return pd.DataFrame(rows)
+
+def aggregate_driver_sim_by_theme(
+    driver_links: pd.DataFrame,
+) -> pd.DataFrame:
+    if driver_links.empty:
+        return pd.DataFrame(columns=[
+            "story_id",
+            "theme_id",
+            "max_driver_sim",
+            "avg_top_driver_sim",
+            "matched_driver_ids",
+            "matched_driver_names_ja",
+        ])
+
+    def top_avg(x: pd.Series, n: int = 3) -> float:
+        return float(x.sort_values(ascending=False).head(n).mean())
+
+    agg = (
+        driver_links
+        .groupby(["story_id", "theme_id"])
+        .agg(
+            max_driver_sim=("driver_sim", "max"),
+            avg_top_driver_sim=("driver_sim", top_avg),
+            matched_driver_ids=("driver_id", lambda x: list(dict.fromkeys(x))),
+            matched_driver_names_ja=("driver_name_ja", lambda x: [v for v in dict.fromkeys(x) if v]),
+        )
+        .reset_index()
+    )
+
+    return agg
+
+def build_news_theme_links_driver_based(
+    news_df: pd.DataFrame,
+    theme_profiles: pd.DataFrame,
+    theme_sim_matrix: np.ndarray,
+    driver_theme_agg: pd.DataFrame,
+    cfg: dict,
+) -> pd.DataFrame:
+    threshold = float(cfg.get("linking", {}).get("threshold", 0.50))
+
+    news_reset = news_df.reset_index(drop=True)
+    theme_reset = theme_profiles.reset_index(drop=True)
+
+    driver_map = {
+        (row["story_id"], row["theme_id"]): row
+        for _, row in driver_theme_agg.iterrows()
+    }
+
+    rows = []
+
+    for i, news_row in news_reset.iterrows():
+        text = news_row.get("clean_text", "") or news_row.get("headline", "")
+        query_type = news_row.get("query_type", "default")
+        related_rics = news_row.get("related_rics", [])
+        if not isinstance(related_rics, list):
+            related_rics = []
+
+        weights = get_weights(query_type, cfg)
+
+        for j, theme_row in theme_reset.iterrows():
+            theme_id = theme_row["theme_id"]
+
+            theme_sim = float(theme_sim_matrix[i, j])
+            theme_sim01 = (theme_sim + 1.0) / 2.0
+
+            drv = driver_map.get((news_row["story_id"], theme_id))
+            if drv is not None:
+                max_driver_sim = float(drv["max_driver_sim"])
+                avg_top_driver_sim = float(drv["avg_top_driver_sim"])
+                matched_driver_ids = drv["matched_driver_ids"]
+                matched_driver_names_ja = drv["matched_driver_names_ja"]
+            else:
+                max_driver_sim = 0.0
+                avg_top_driver_sim = 0.0
+                matched_driver_ids = []
+                matched_driver_names_ja = []
+
+            kw = keyword_score(
+                text,
+                theme_row.get("keyword_terms_en", []),
+                theme_row.get("keyword_terms_ja", []),
+            )
+
+            ent = entity_score(text, related_rics, theme_row)
+
+            rel_score = (
+                weights["theme_embedding"] * theme_sim01
+                + weights["driver_embedding"] * max_driver_sim
+                + weights["keyword"] * kw
+                + weights["entity"] * ent
+            )
+
+            if rel_score >= threshold:
+                rows.append({
+                    "story_id": news_row["story_id"],
+                    "date_jst": news_row.get("date_jst", ""),
+                    "query_type": query_type,
+                    "theme_id": theme_id,
+                    "theme_sim": theme_sim01,
+                    "max_driver_sim": max_driver_sim,
+                    "avg_top_driver_sim": avg_top_driver_sim,
+                    "keyword_score": kw,
+                    "entity_score": ent,
+                    "rel_score": rel_score,
+                    "matched_driver_ids": matched_driver_ids,
+                    "matched_driver_names_ja": matched_driver_names_ja,
+                    "headline": news_row.get("headline", ""),
+                })
+
+    return pd.DataFrame(rows)
+```
+
+---
+
+# 8. Tone の定義
+
+Tone は従来と同じでよいですが、テーマプロファイル由来の positive / negative events を活用します。
+
+```python
+def simple_tone_multilingual(
+    text: str,
+    positive_en: list[str],
+    positive_ja: list[str],
+    negative_en: list[str],
+    negative_ja: list[str],
+) -> float:
+    if not isinstance(text, str):
+        return 0.0
+
+    lower = text.lower()
+
+    pos = 0
+    neg = 0
+
+    for term in positive_en or []:
+        if term and str(term).lower() in lower:
+            pos += 1
+
+    for term in positive_ja or []:
+        if term and str(term) in text:
+            pos += 1
+
+    for term in negative_en or []:
+        if term and str(term).lower() in lower:
+            neg += 1
+
+    for term in negative_ja or []:
+        if term and str(term) in text:
+            neg += 1
+
+    return (pos - neg) / (pos + neg + 1.0)
+```
+
+テーマ別 Tone は、`rel_score` で加重します。
+
+$$
+Tone_{k,t}
+=
+\frac{
+\sum_d Rel_{d,k} \cdot Tone_{d,k}
+}{
+\sum_d Rel_{d,k} + \epsilon
+}
+$$
+
+注意点として、Tone はニュース単独で一意に決まるとは限りません。  
+たとえば「金利上昇」は銀行にはポジティブ、不動産にはネガティブです。したがって、将来的には **theme-specific tone** にします。
+
+---
+
+# 9. DriverBreadth / EntityBreadth
+
+## 9.1 DriverBreadth
+
+```python
+def compute_driver_breadth(
+    driver_links: pd.DataFrame,
+    driver_profiles: pd.DataFrame,
+    min_driver_sim: float = 0.45,
+) -> pd.DataFrame:
+    if driver_links.empty:
+        return pd.DataFrame(columns=[
+            "date_jst",
+            "theme_id",
+            "driver_breadth_raw",
+            "n_active_drivers",
+            "n_total_drivers",
+        ])
+
+    active = (
+        driver_links[driver_links["driver_sim"] >= min_driver_sim]
+        .groupby(["date_jst", "theme_id"])["driver_id"]
+        .nunique()
+        .reset_index(name="n_active_drivers")
+    )
+
+    total = (
+        driver_profiles
+        .groupby("theme_id")["driver_id"]
+        .nunique()
+        .reset_index(name="n_total_drivers")
+    )
+
+    out = active.merge(total, on="theme_id", how="left")
+    out["driver_breadth_raw"] = out["n_active_drivers"] / out["n_total_drivers"].replace(0, pd.NA)
+    out["driver_breadth_raw"] = out["driver_breadth_raw"].fillna(0.0)
+
+    return out
+```
+
+---
+
+## 9.2 EntityBreadth
+
+RIC取得を減らすので、EntityBreadth は補助指標です。
+
+```python
+def compute_entity_breadth(
+    news_theme_links: pd.DataFrame,
+    news_df: pd.DataFrame,
+    theme_profiles: pd.DataFrame,
+) -> pd.DataFrame:
+    if news_theme_links.empty:
+        return pd.DataFrame(columns=[
+            "date_jst",
+            "theme_id",
+            "entity_breadth_raw",
+        ])
+
+    news_small = news_df[["story_id", "related_rics"]].copy()
+    merged = news_theme_links.merge(news_small, on="story_id", how="left")
+
+    theme_map = theme_profiles.set_index("theme_id")["entity_rics"].to_dict()
+
+    rows = []
+
+    for (date_jst, theme_id), sub in merged.groupby(["date_jst", "theme_id"]):
+        theme_rics = set(theme_map.get(theme_id, []) or [])
+        if not theme_rics:
+            breadth = 0.0
+        else:
+            mentioned = set()
+            for xs in sub["related_rics"]:
+                if isinstance(xs, list):
+                    mentioned.update(xs)
+            breadth = len(theme_rics & mentioned) / len(theme_rics)
+
+        rows.append({
+            "date_jst": date_jst,
+            "theme_id": theme_id,
+            "entity_breadth_raw": breadth,
+        })
+
+    return pd.DataFrame(rows)
+```
+
+---
+
+# 10. 日次特徴量作成
+
+## 10.1 `features_driver_based.py`
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+def cross_sectional_zscore(df: pd.DataFrame, value_col: str, date_col: str = "date") -> pd.Series:
+    def z(x):
+        std = x.std(ddof=0)
+        if std == 0 or np.isnan(std):
+            return x * 0.0
+        return (x - x.mean()) / std
+
+    return df.groupby(date_col)[value_col].transform(z)
+
+def build_daily_theme_features_driver_based(
+    news_df: pd.DataFrame,
+    news_theme_links: pd.DataFrame,
+    driver_links: pd.DataFrame,
+    driver_profiles: pd.DataFrame,
+    theme_profiles: pd.DataFrame,
+    lookback_days: int = 40,
+) -> pd.DataFrame:
+    links = news_theme_links.copy()
+    links["date"] = pd.to_datetime(links["date_jst"])
+
+    # Mentions / weighted mentions
+    feat = (
+        links
+        .groupby(["date", "theme_id"])
+        .agg(
+            mentions=("story_id", "nunique"),
+            weighted_mentions=("rel_score", "sum"),
+            avg_rel_score=("rel_score", "mean"),
+            max_driver_sim=("max_driver_sim", "mean"),
+            keyword_score=("keyword_score", "mean"),
+            entity_score=("entity_score", "mean"),
+        )
+        .reset_index()
+    )
+
+    # Tone
+    if "tone" in links.columns:
+        links["weighted_tone"] = links["rel_score"] * links["tone"]
+        tone = (
+            links
+            .groupby(["date", "theme_id"])
+            .agg(
+                weighted_tone_sum=("weighted_tone", "sum"),
+                rel_sum=("rel_score", "sum"),
+            )
+            .reset_index()
+        )
+        tone["tone_raw"] = tone["weighted_tone_sum"] / (tone["rel_sum"] + 1e-12)
+        feat = feat.merge(tone[["date", "theme_id", "tone_raw"]], on=["date", "theme_id"], how="left")
+    else:
+        feat["tone_raw"] = 0.0
+
+    # Full date-theme panel
+    all_dates = pd.date_range(feat["date"].min(), feat["date"].max(), freq="D")
+    all_themes = theme_profiles["theme_id"].tolist()
+
+    panel = pd.MultiIndex.from_product(
+        [all_dates, all_themes],
+        names=["date", "theme_id"],
+    ).to_frame(index=False)
+
+    feat = panel.merge(feat, on=["date", "theme_id"], how="left")
+
+    fill_cols = [
+        "mentions",
+        "weighted_mentions",
+        "avg_rel_score",
+        "max_driver_sim",
+        "keyword_score",
+        "entity_score",
+        "tone_raw",
+    ]
+    for col in fill_cols:
+        if col in feat.columns:
+            feat[col] = feat[col].fillna(0.0)
+
+    # Buzz
+    feat = feat.sort_values(["theme_id", "date"])
+    feat["wm_log"] = np.log1p(feat["weighted_mentions"])
+    feat["wm_log_ma"] = (
+        feat.groupby("theme_id")["wm_log"]
+        .transform(lambda s: s.shift(1).rolling(lookback_days, min_periods=5).mean())
+    )
+    feat["buzz_raw"] = feat["wm_log"] - feat["wm_log_ma"].fillna(0.0)
+
+    # DriverBreadth
+    drv_breadth = compute_driver_breadth(driver_links, driver_profiles)
+    if not drv_breadth.empty:
+        drv_breadth["date"] = pd.to_datetime(drv_breadth["date_jst"])
+        feat = feat.merge(
+            drv_breadth[["date", "theme_id", "driver_breadth_raw"]],
+            on=["date", "theme_id"],
+            how="left",
+        )
+    else:
+        feat["driver_breadth_raw"] = 0.0
+
+    feat["driver_breadth_raw"] = feat["driver_breadth_raw"].fillna(0.0)
+
+    # EntityBreadth
+    ent_breadth = compute_entity_breadth(news_theme_links, news_df, theme_profiles)
+    if not ent_breadth.empty:
+        ent_breadth["date"] = pd.to_datetime(ent_breadth["date_jst"])
+        feat = feat.merge(
+            ent_breadth[["date", "theme_id", "entity_breadth_raw"]],
+            on=["date", "theme_id"],
+            how="left",
+        )
+    else:
+        feat["entity_breadth_raw"] = 0.0
+
+    feat["entity_breadth_raw"] = feat["entity_breadth_raw"].fillna(0.0)
+
+    # Cross-sectional standardization
+    feat["buzz"] = cross_sectional_zscore(feat, "buzz_raw")
+    feat["tone"] = cross_sectional_zscore(feat, "tone_raw")
+    feat["driver_breadth"] = cross_sectional_zscore(feat, "driver_breadth_raw")
+    feat["entity_breadth"] = cross_sectional_zscore(feat, "entity_breadth_raw")
+
+    # ThemeScore
+    feat["theme_score"] = (
+        0.35 * feat["buzz"]
+        + 0.25 * feat["tone"]
+        + 0.30 * feat["driver_breadth"]
+        + 0.10 * feat["entity_breadth"]
+    )
+
+    return feat
+```
+
+このファイル内では、先ほどの `compute_driver_breadth()` と `compute_entity_breadth()` も同じファイルに入れるか、別モジュールから import してください。
+
+---
+
+# 11. ポートフォリオ構築
+
+これは従来通りです。
+
+```python
+def select_top_themes(
+    scores: pd.DataFrame,
+    n_top: int = 4,
+    score_col: str = "theme_score",
+) -> pd.DataFrame:
+    rows = []
+
+    for date, sub in scores.groupby("date"):
+        ranked = sub.sort_values(score_col, ascending=False).head(n_top)
+
+        for _, row in ranked.iterrows():
+            rows.append({
+                "date": date,
+                "theme_id": row["theme_id"],
+                "theme_weight": 1.0 / n_top,
+                "theme_score": row[score_col],
+            })
+
+    return pd.DataFrame(rows)
+```
+
+---
+
+# 12. `main.ipynb` の実行順
+
+Notebook は以下の順番にします。
+
+```text
+1. Setup
+2. Load config
+3. Load theme_profiles.yaml
+4. Build theme_profiles dataframe
+5. Build driver_profiles dataframe
+6. Fetch broad LSEG news
+7. Clean news text
+8. Load embedding model
+9. Embed news
+10. Embed theme profiles
+11. Embed driver profiles
+12. Compute news-theme similarity
+13. Compute news-driver similarity
+14. Build news_driver_links
+15. Aggregate driver links by theme
+16. Build news_theme_links
+17. Add theme-specific tone
+18. Build Buzz / Tone / DriverBreadth / EntityBreadth
+19. Compute ThemeScore
+20. Select top 4 themes
+21. Export outputs
+22. Plot theme scores
+```
+
+---
+
+# 13. 出力ファイル
+
+```text
+data/interim/
+  news_clean.parquet or news_clean.pkl
+  theme_profiles.parquet
+  theme_driver_profiles.parquet
+  news_embeddings.npy
+  theme_embeddings.npy
+  driver_embeddings.npy
+  news_driver_links.parquet
+  news_theme_links.parquet
+
+data/processed/
+  theme_news_features_daily.parquet
+  theme_scores.parquet
+  theme_weights.parquet
+
+outputs/tables/
+  news_driver_links_sample.csv
+  news_theme_links_sample.csv
+  theme_scores_latest.csv
+  theme_weights_latest.csv
+
+outputs/figures/
+  theme_score_timeseries_top10.png
+  selected_theme_heatmap.png
+  driver_breadth_timeseries.png
+```
+
+---
+
+# 14. Codex 実装指示書
+
+そのまま渡すなら以下です。
+
+```markdown
+# Codex Implementation Prompt: Broad News + Revenue Driver Theme Rotation
+
+## Objective
+
+Implement a reproducible Python research pipeline for Japanese equity theme rotation using LSEG news.
+
+This version should reduce reliance on RIC-based news fetching. The main approach is:
+
+1. Fetch broad LSEG news by market / macro-policy / industry / style-event queries
+2. Build theme profile embeddings
+3. Build revenue-driver-level embeddings from theme profiles
+4. Link news to themes through theme similarity and revenue driver similarity
+5. Compute Buzz, Tone, DriverBreadth, and EntityBreadth
+6. Compute ThemeScore
+7. Select top 4 themes equal-weighted
+
+## Core Change from Prior Version
+
+Do not use all constituent RICs as the primary news retrieval method.
+
+RIC queries should be optional and limited to:
+- top 5 constituents per theme
+- validation
+- selected themes
+- entity breadth supplement
+
+The primary signal should come from broad news and revenue-driver similarity.
+
+## Required Modules
+
+Create or update:
+
+src/theme_news_rotation_jp/
+  theme_profile.py
+  driver_profile.py
+  embeddings.py
+  news_loader.py
+  driver_linker.py
+  sentiment.py
+  features_driver_based.py
+  portfolio.py
+  reporting.py
+
+## Config
+
+Use broad queries:
+
+- japan_market_broad_en
+- japan_macro_policy_en
+- japan_industry_broad_en
+- japan_style_event_broad_en
+
+Use query_type-specific weights:
+
+broad_market:
+  theme_embedding: 0.30
+  driver_embedding: 0.45
+  keyword: 0.20
+  entity: 0.05
+
+broad_macro_policy:
+  theme_embedding: 0.20
+  driver_embedding: 0.50
+  keyword: 0.25
+  entity: 0.05
+
+broad_industry:
+  theme_embedding: 0.25
+  driver_embedding: 0.50
+  keyword: 0.20
+  entity: 0.05
+
+broad_style_event:
+  theme_embedding: 0.20
+  driver_embedding: 0.45
+  keyword: 0.30
+  entity: 0.05
+
+constituent_ric:
+  theme_embedding: 0.20
+  driver_embedding: 0.20
+  keyword: 0.10
+  entity: 0.50
+
+default:
+  theme_embedding: 0.30
+  driver_embedding: 0.45
+  keyword: 0.20
+  entity: 0.05
+
+Default link threshold: 0.50.
+
+## Theme Profiles
+
+Read configs/theme_profiles.yaml.
+
+Each theme has:
+
+- theme_id
+- theme_name_en
+- theme_name_ja
+- theme_type
+- description_en
+- description_ja
+- revenue_drivers_en
+- revenue_drivers_ja
+- catalysts_en
+- catalysts_ja
+- positive_events_en
+- positive_events_ja
+- negative_events_en
+- negative_events_ja
+- keyword_match_terms_en
+- keyword_match_terms_ja
+- entity_linking_terms
+
+Build:
+
+1. theme_profiles dataframe
+2. driver_profiles dataframe
+
+Driver profiles should be built from:
+- revenue_drivers_en / revenue_drivers_ja
+- optionally catalysts_en / catalysts_ja
+
+Each driver row should have:
+- theme_id
+- driver_id
+- driver_type
+- driver_name_en
+- driver_name_ja
+- driver_embedding_text
+
+## Linking
+
+Compute:
+
+- news_theme_sim_matrix
+- news_driver_sim_matrix
+
+Create news_driver_links for driver_sim >= min_driver_sim.
+
+Aggregate driver links by story_id, theme_id:
+- max_driver_sim
+- avg_top_driver_sim
+- matched_driver_ids
+- matched_driver_names_ja
+
+Create news_theme_links with:
+
+rel_score =
+  w_theme * theme_sim
++ w_driver * max_driver_sim
++ w_keyword * keyword_score
++ w_entity * entity_score
+
+Keep rows where rel_score >= threshold.
+
+## Features
+
+Daily theme features:
+
+WeightedMentions_{k,t} = sum rel_score
+
+Buzz:
+log(1 + weighted_mentions)
+minus rolling mean of previous 40 days,
+then cross-sectional z-score by date.
+
+Tone:
+theme-specific positive/negative event dictionary.
+weighted average by rel_score.
+
+DriverBreadth:
+number of active drivers for theme/date divided by total drivers for the theme.
+
+EntityBreadth:
+number of mentioned entities divided by total known entities for the theme.
+This is supplementary because broad news may not have RICs.
+
+ThemeScore:
+0.35 * Buzz
++ 0.25 * Tone
++ 0.30 * DriverBreadth
++ 0.10 * EntityBreadth
+
+## Portfolio
+
+Select top 4 themes by ThemeScore on each date.
+Allocate 25% to each selected theme.
+Export theme weights.
+
+## Notebook
+
+Create main_driver_based.ipynb with sections:
+
+1. Setup
+2. Load configs
+3. Load theme profiles
+4. Build driver profiles
+5. Fetch broad LSEG news
+6. Clean news
+7. Embed news / themes / drivers
+8. Link news to drivers
+9. Link news to themes
+10. Compute daily features
+11. Compute ThemeScore
+12. Select top 4 themes
+13. Save outputs
+14. Plot results
+
+## Outputs
+
+Save:
+
+data/interim/theme_profiles.parquet
+data/interim/theme_driver_profiles.parquet
+data/interim/news_driver_links.parquet
+data/interim/news_theme_links.parquet
+data/processed/theme_news_features_daily.parquet
+data/processed/theme_weights.parquet
+
+outputs/tables/news_driver_links_sample.csv
+outputs/tables/news_theme_links_sample.csv
+outputs/tables/theme_scores_latest.csv
+outputs/tables/theme_weights_latest.csv
+
+outputs/figures/theme_score_timeseries_top10.png
+outputs/figures/selected_theme_heatmap.png
+```
+
+---
+
+# 15. 実装上の優先順位
+
+最初に実装すべき順番は以下です。
+
+```text
+1. driver_profiles を作る
+2. Broad query で news_df を作る
+3. news × driver 類似度を作る
+4. news_driver_links を目視確認する
+5. news_theme_links を作る
+6. DriverBreadth を作る
+7. ThemeScore を作る
+8. Top4テーマを選ぶ
+```
+
+特に重要なのは、いきなり ThemeScore を見ないことです。
+
+まず確認すべきは、
+
+```text
+ニュース headline
+  ↓
+どの driver に近いと判定されたか
+  ↓
+どの theme に紐づいたか
+```
+
+です。
+
+確認用テーブル：
+
+```python
+debug_links = (
+    news_driver_links
+    .sort_values("driver_sim", ascending=False)
+    .head(100)
+)
+
+display(debug_links[[
+    "date_jst",
+    "theme_id",
+    "driver_name_ja",
+    "driver_name_en",
+    "driver_sim",
+    "headline",
+]])
+```
+
+---
+
+# 16. この新手法の実務的な意味
+
+この手法では、テーマを単なる銘柄集合として扱うのではなく、次のように扱います。
+
+```text
+テーマ = 収益ドライバーの集合
+```
+
+たとえば地銀テーマなら、
+
+```text
+- 国内金利上昇
+- イールドカーブのスティープ化
+- 預貸利ざや改善
+- 株主還元強化
+- 債券ポートフォリオ評価損益
+```
+
+これらのドライバーがニュース上で同時に反応していれば、個別銀行 RIC ニュースを大量に取らなくても、テーマの盛り上がりを測れます。
+
+---
+
+# 17. 最終形
+
+最終的なモデルは以下です。
+
+$$
+Rel_{d,k}
+=
+w_T ThemeSim_{d,k}
++
+w_D \max_m DriverSim_{d,k,m}
++
+w_K KeywordScore_{d,k}
++
+w_E EntityScore_{d,k}
+$$
+
+$$
+Buzz_{k,t}
+=
+z_{cs}
+\left[
+\log(1+\sum_d Rel_{d,k})
+-
+MA_{40}
+\right]
+$$
+
+$$
+DriverBreadth_{k,t}
+=
+\frac{
+\#\{m : DriverAttention_{k,m,t} > \theta\}
+}{
+\# Drivers(k)
+}
+$$
+
+$$
+ThemeScore_{k,t}
+=
+0.35 Buzz_{k,t}
++
+0.25 Tone_{k,t}
++
+0.30 DriverBreadth_{k,t}
++
+0.10 EntityBreadth_{k,t}
+$$
+
+この設計により、**RICニュース取得量を抑えながら、テーマ全体のニュース上の盛り上がりを、収益ドライバー単位で測定する**ことができます。
+
+## Response:
+2026/4/29 23:16:23
+
+以下は、既存の **theme definition / theme profile** を ChatGPT などの LLM で拡張し、今回の新手法で使う **Broad News + Revenue Driver Based Theme Rotation** に適した形式へ変換するための指示書です。
+
+そのまま `theme_definition_expansion_prompt.md` として保存して使える内容にしています。
+
+---
+
+# Theme Definition 拡張指示書  
+## Broad News + Revenue Driver Based Theme Rotation 用
+
+## 1. 目的
+
+あなたは、日本株テーマ投資、金融ニュース分類、自然言語処理、クオンツ運用に詳しいリサーチャーです。
+
+与えられた既存のテーマ定義をもとに、LSEG / Refinitiv ニュースを用いたテーマローテーション戦略で利用するための、拡張済みテーマ定義を作成してください。
+
+この拡張済みテーマ定義は、以下の処理に使います。
+
+```text
+Broadニュース取得
+  ↓
+テーマ定義 embedding
+  ↓
+収益ドライバー embedding
+  ↓
+ニュース → 収益ドライバー → テーマへの多ラベル帰属
+  ↓
+Buzz / Tone / DriverBreadth / EntityBreadth
+  ↓
+ThemeScore
+  ↓
+上位テーマ選択
+```
+
+したがって、単なるテーマ説明の翻訳や要約ではなく、以下を明確に定義してください。
+
+- テーマの投資対象
+- 収益ドライバー
+- ニュースで出現しやすいカタリスト
+- ポジティブイベント
+- ネガティブイベント
+- 関連マクロ要因
+- 関連政策要因
+- テーマと関係する業種・産業
+- ニュース分類に使うキーワード
+- embedding 用の説明文
+- driver embedding 用の収益ドライバー定義
+
+---
+
+# 2. 入力データ
+
+入力として、以下のいずれか、または複数が与えられます。
+
+## 2.1 最小入力
+
+```yaml
+theme_id:
+theme_name_en:
+theme_name_ja:
+theme_description_en:
+theme_description_ja:
+```
+
+## 2.2 企業構成情報がある場合
+
+```yaml
+constituents:
+  - company_id:
+    ric:
+    weight:
+    company_name_en:
+    company_name_ja:
+    company_description_en:
+    company_description_ja:
+    gics_sector:
+    gics_industry:
+    trbc_industry:
+```
+
+## 2.3 既存テーマプロファイルがある場合
+
+```yaml
+theme_id:
+theme_name_en:
+theme_name_ja:
+theme_type:
+description_en:
+description_ja:
+revenue_drivers_en:
+revenue_drivers_ja:
+catalysts_en:
+catalysts_ja:
+positive_events_en:
+positive_events_ja:
+negative_events_en:
+negative_events_ja:
+related_macro_factors_en:
+related_macro_factors_ja:
+related_policy_factors_en:
+related_policy_factors_ja:
+keyword_match_terms_en:
+keyword_match_terms_ja:
+entity_linking_terms:
+```
+
+既存項目がある場合は、それを尊重しつつ、今回のニュース分類・収益ドライバー分類に適した形へ拡張してください。
+
+---
+
+# 3. 出力形式
+
+必ず以下の YAML 形式で出力してください。
+
+```yaml
+themes:
+  - theme_id: ""
+    theme_name_en: ""
+    theme_name_ja: ""
+    theme_type: ""
+
+    description_en: ""
+    description_ja: ""
+
+    profile_summary_en: ""
+    profile_summary_ja: ""
+
+    revenue_drivers:
+      - driver_id: ""
+        driver_name_en: ""
+        driver_name_ja: ""
+        driver_type: ""
+        driver_description_en: ""
+        driver_description_ja: ""
+        driver_embedding_text: ""
+        driver_keywords_en:
+          - ""
+        driver_keywords_ja:
+          - ""
+        positive_driver_events_en:
+          - ""
+        positive_driver_events_ja:
+          - ""
+        negative_driver_events_en:
+          - ""
+        negative_driver_events_ja:
+          - ""
+
+    catalysts_en:
+      - ""
+    catalysts_ja:
+      - ""
+
+    positive_events_en:
+      - ""
+    positive_events_ja:
+      - ""
+
+    negative_events_en:
+      - ""
+    negative_events_ja:
+      - ""
+
+    related_macro_factors_en:
+      - ""
+    related_macro_factors_ja:
+      - ""
+
+    related_policy_factors_en:
+      - ""
+    related_policy_factors_ja:
+      - ""
+
+    related_industries:
+      gics_sectors:
+        - ""
+      gics_industries:
+        - ""
+      trbc_industries:
+        - ""
+
+    keyword_match_terms_en:
+      - ""
+    keyword_match_terms_ja:
+      - ""
+
+    embedding_text: ""
+
+    entity_linking_terms:
+      rics:
+        - ""
+      company_names_en:
+        - ""
+      company_names_ja:
+        - ""
+      aliases_en:
+        - ""
+      aliases_ja:
+        - ""
+
+    notes_for_classification: ""
+```
+
+---
+
+# 4. 各項目の作成ルール
+
+## 4.1 `theme_id`
+
+入力の `theme_id` をそのまま使ってください。
+
+禁止事項：
+
+- 変更しない
+- 翻訳しない
+- 新しいIDを勝手に作らない
+
+---
+
+## 4.2 `theme_name_en`
+
+入力の英語テーマ名を尊重してください。
+
+必要に応じて、ニュース分類に使いやすい自然な英語名へ補助的に整えてもよいですが、元の意味を変えないでください。
+
+---
+
+## 4.3 `theme_name_ja`
+
+入力に日本語テーマ名がある場合は、それを尊重してください。
+
+ない場合は、`theme_name_en` と `theme_description_ja` をもとに自然な日本語名を作成してください。
+
+例：
+
+```yaml
+theme_name_en: "Low PBR Reform"
+theme_name_ja: "低PBR・資本効率改革"
+```
+
+---
+
+## 4.4 `theme_type`
+
+以下から1つ選んでください。
+
+```yaml
+industry_theme
+style_theme
+policy_theme
+macro_theme
+event_theme
+industry_policy_theme
+macro_style_theme
+```
+
+判断基準は以下です。
+
+| theme_type | 判断基準 | 例 |
+|---|---|---|
+| `industry_theme` | 産業、業種、技術、サプライチェーンが主軸 | 半導体、AI、電力インフラ、医療機器 |
+| `style_theme` | バリュエーション、財務特性、株主還元が主軸 | 低PBR、高配当、クオリティ |
+| `policy_theme` | 政策、規制、政府支出、補助金が主軸 | 防衛、GX、国土強靭化 |
+| `macro_theme` | 金利、為替、資源価格、景気が主軸 | 円安メリット、資源高、インフレ |
+| `event_theme` | M&A、自社株買い、決算、承認などが主軸 | TOB、自社株買い、薬事承認 |
+| `industry_policy_theme` | 産業テーマと政策テーマの両方 | 防衛、半導体国内生産、電力網 |
+| `macro_style_theme` | マクロ環境とスタイル特性の両方 | 地銀・金利上昇メリット、インフレ耐性高配当 |
+
+判断が難しい場合は、**ニュース分類で最も役に立つ分類**を選んでください。
+
+---
+
+# 5. テーマ説明の作成
+
+## 5.1 `description_en` / `description_ja`
+
+テーマの説明を3〜6文で作成してください。
+
+必ず以下を含めます。
+
+- 投資対象の概要
+- 主な収益ドライバー
+- ニュースで検出すべき論点
+- 構成銘柄情報がある場合は、その実態
+- テーマが反応しやすいマクロ・政策・産業イベント
+
+悪い例：
+
+```yaml
+description_ja: "AI関連企業に投資するテーマ。"
+```
+
+良い例：
+
+```yaml
+description_ja: >
+  このテーマは、生成AI、AI半導体、データセンター、クラウド基盤、
+  産業用AIソフトウェア、電子部品、半導体製造装置に関連する日本株を対象とする。
+  主な収益ドライバーは、AIサーバー需要、データセンター投資、
+  半導体設備投資、企業のDX投資、クラウド利用拡大である。
+  ニュース分類では、GPU需要、AI設備投資、半導体受注、データセンター増設、
+  ハイパースケーラーの投資計画などを重視する。
+```
+
+---
+
+## 5.2 `profile_summary_en` / `profile_summary_ja`
+
+1〜2文で、投資テーマとして何にエクスポージャーを取っているかを簡潔にまとめてください。
+
+例：
+
+```yaml
+profile_summary_ja: >
+  AI半導体需要、データセンター投資、クラウド基盤拡大、半導体設備投資に連動する日本株テーマ。
+  ニュース分類では、AI設備投資、半導体受注、データセンター増設に関する報道を重視する。
+```
+
+---
+
+# 6. 収益ドライバーの作成
+
+## 6.1 `revenue_drivers`
+
+今回の新手法では、最重要項目です。
+
+テーマを **収益ドライバーの集合**として定義してください。
+
+各テーマにつき、原則として **5〜12個** の収益ドライバーを作成してください。
+
+少なすぎると DriverBreadth が粗くなり、多すぎるとノイズが増えます。
+
+---
+
+## 6.2 `driver_id`
+
+以下の形式で作成してください。
+
+```yaml
+driver_id: "<theme_id>__driver_001"
+```
+
+例：
+
+```yaml
+driver_id: "semiconductor_equipment_jp__driver_001"
+```
+
+---
+
+## 6.3 `driver_type`
+
+以下から1つ選んでください。
+
+```yaml
+demand_driver
+supply_driver
+capex_driver
+policy_driver
+macro_driver
+valuation_driver
+shareholder_return_driver
+earnings_driver
+technology_driver
+regulatory_driver
+event_driver
+```
+
+判断基準：
+
+| driver_type | 内容 |
+|---|---|
+| `demand_driver` | 最終需要、販売量、利用拡大 |
+| `supply_driver` | 供給制約、在庫、サプライチェーン |
+| `capex_driver` | 設備投資、建設投資、投資サイクル |
+| `policy_driver` | 政策支援、補助金、政府支出 |
+| `macro_driver` | 金利、為替、資源価格、景気 |
+| `valuation_driver` | PBR、PER、資本効率、割安修正 |
+| `shareholder_return_driver` | 自社株買い、増配、配当方針 |
+| `earnings_driver` | 業績修正、受注、利益率、決算 |
+| `technology_driver` | 技術革新、製品サイクル |
+| `regulatory_driver` | 規制、承認、輸出管理 |
+| `event_driver` | M&A、TOB、訴訟、災害、事故 |
+
+---
+
+## 6.4 driver の作成例
+
+```yaml
+revenue_drivers:
+  - driver_id: "semiconductor_equipment_jp__driver_001"
+    driver_name_en: "Semiconductor capital expenditure cycle"
+    driver_name_ja: "半導体設備投資サイクル"
+    driver_type: "capex_driver"
+    driver_description_en: >
+      Demand for Japanese semiconductor equipment is driven by global wafer fab investment,
+      memory and logic capacity expansion, foundry capex, and AI-related semiconductor investment.
+    driver_description_ja: >
+      日本の半導体製造装置関連企業の収益は、グローバルな半導体工場投資、
+      メモリ・ロジックの生産能力増強、ファウンドリー投資、AI半導体向け設備投資に左右される。
+    driver_embedding_text: >
+      Semiconductor capital expenditure cycle. 半導体設備投資サイクル。
+      Wafer fab investment, foundry capex, AI semiconductor investment, memory capacity expansion,
+      semiconductor equipment orders, 半導体製造装置受注、ファウンドリー投資、AI半導体設備投資。
+    driver_keywords_en:
+      - semiconductor capex
+      - wafer fab investment
+      - foundry capex
+      - chip equipment orders
+      - memory capacity expansion
+    driver_keywords_ja:
+      - 半導体設備投資
+      - 半導体製造装置受注
+      - ファウンドリー投資
+      - メモリ投資
+      - AI半導体投資
+    positive_driver_events_en:
+      - capex increase
+      - order recovery
+      - foundry investment expansion
+      - memory price recovery
+    positive_driver_events_ja:
+      - 設備投資増額
+      - 受注回復
+      - ファウンドリー投資拡大
+      - メモリ価格回復
+    negative_driver_events_en:
+      - capex cut
+      - order decline
+      - investment delay
+      - export restrictions
+    negative_driver_events_ja:
+      - 設備投資削減
+      - 受注減少
+      - 投資延期
+      - 輸出規制
+```
+
+---
+
+# 7. カタリストの作成
+
+## 7.1 `catalysts_en` / `catalysts_ja`
+
+ニュース本文・見出しに出やすい語句を作成してください。
+
+要件：
+
+- 各言語 10〜30個
+- 名詞句中心
+- テーマ名そのものに依存しない
+- 同義語・表記ゆれを含める
+- 抽象語を避ける
+
+悪い例：
+
+```yaml
+catalysts_ja:
+  - 成長
+  - 市場
+  - 需要
+  - 投資
+```
+
+良い例：
+
+```yaml
+catalysts_ja:
+  - 半導体設備投資
+  - 半導体製造装置受注
+  - AI半導体
+  - ファウンドリー投資
+  - メモリ市況
+  - 輸出規制
+  - データセンター投資
+```
+
+---
+
+# 8. Positive / Negative Events
+
+## 8.1 `positive_events_en` / `positive_events_ja`
+
+テーマ全体にとってポジティブと解釈されやすいイベントを作成してください。
+
+例：
+
+```yaml
+positive_events_ja:
+  - 上方修正
+  - 受注増加
+  - 設備投資増額
+  - 自社株買い発表
+  - 増配
+  - 補助金採択
+  - 規制承認
+  - 価格上昇
+```
+
+---
+
+## 8.2 `negative_events_en` / `negative_events_ja`
+
+テーマ全体にとってネガティブと解釈されやすいイベントを作成してください。
+
+例：
+
+```yaml
+negative_events_ja:
+  - 下方修正
+  - 受注減少
+  - 設備投資延期
+  - 減配
+  - 公募増資
+  - 輸出規制
+  - 行政処分
+  - 訴訟
+  - コスト増
+```
+
+---
+
+# 9. マクロ・政策要因
+
+## 9.1 `related_macro_factors_en` / `related_macro_factors_ja`
+
+テーマに影響するマクロ要因を列挙してください。
+
+例：
+
+```yaml
+related_macro_factors_ja:
+  - 国内金利
+  - 長期金利
+  - 米ドル円
+  - 半導体サイクル
+  - 設備投資サイクル
+  - 原油価格
+  - 電力価格
+```
+
+関係が薄い場合は空リストで構いません。
+
+```yaml
+related_macro_factors_ja: []
+related_macro_factors_en: []
+```
+
+---
+
+## 9.2 `related_policy_factors_en` / `related_policy_factors_ja`
+
+政策・規制・政府支出・補助金・制度改革に関係する要因を列挙してください。
+
+例：
+
+```yaml
+related_policy_factors_ja:
+  - 防衛予算
+  - 半導体補助金
+  - GX政策
+  - 電力系統投資
+  - 東証による資本効率改善要請
+  - 経済安全保障
+```
+
+---
+
+# 10. 関連業種
+
+## 10.1 `related_industries`
+
+構成銘柄情報がある場合は、GICS / TRBC を集約してください。
+
+```yaml
+related_industries:
+  gics_sectors:
+    - "Information Technology"
+    - "Industrials"
+  gics_industries:
+    - "Semiconductors & Semiconductor Equipment"
+    - "Electronic Equipment, Instruments & Components"
+  trbc_industries:
+    - "Semiconductor Equipment"
+    - "Electronic Equipment & Parts"
+```
+
+ルール：
+
+- 重複を除去する
+- ウェイト上位または出現頻度が高いものを優先
+- 最大10個程度に抑える
+- 入力データにある表記を尊重する
+
+---
+
+# 11. Keyword Match Terms
+
+## 11.1 `keyword_match_terms_en` / `keyword_match_terms_ja`
+
+ニュースのキーワード一致スコアに使う語句です。
+
+以下を統合してください。
+
+- catalysts
+- revenue driver keywords
+- positive events
+- negative events
+- macro factors
+- policy factors
+- 業界用語
+- 表記ゆれ
+
+各言語 **20〜50語** を目安にしてください。
+
+---
+
+## 11.2 避ける語
+
+単体では広すぎる語は避けてください。
+
+避けるべき例：
+
+```text
+成長
+市場
+需要
+投資
+企業
+事業
+株価
+材料
+```
+
+使うなら具体化してください。
+
+```text
+AI需要
+データセンター投資
+半導体設備投資
+防衛予算
+資本効率改善
+自社株買い発表
+```
+
+---
+
+# 12. Embedding Text
+
+## 12.1 `embedding_text`
+
+テーマ全体の embedding に使う文章です。
+
+必ず以下を含めてください。
+
+- `theme_name_en`
+- `theme_name_ja`
+- `description_en`
+- `description_ja`
+- `profile_summary_en`
+- `profile_summary_ja`
+- revenue drivers の要約
+- catalysts の要約
+- related macro / policy factors
+- 構成銘柄がある場合は、主要構成銘柄の特徴
+
+---
+
+## 12.2 作成ルール
+
+- 日本語と英語を両方含める
+- ニュース本文に近い語彙を含める
+- 長すぎないようにする
+- 構成銘柄説明を入れる場合は、上位30社または累積80%まで
+- 一企業だけに過度に寄せない
+
+---
+
+# 13. Entity Linking Terms
+
+## 13.1 `entity_linking_terms`
+
+構成銘柄情報がある場合は作成してください。
+
+```yaml
+entity_linking_terms:
+  rics:
+    - "8035.T"
+    - "6857.T"
+  company_names_en:
+    - "Tokyo Electron"
+    - "Advantest"
+  company_names_ja:
+    - "東京エレクトロン"
+    - "アドバンテスト"
+  aliases_en:
+    - "TEL"
+  aliases_ja:
+    - "東エレク"
+```
+
+ルール：
+
+- RIC は入力値を変更しない
+- 企業名は入力値を尊重する
+- aliases は、明らかに一般的な略称のみ追加する
+- 勝手に企業を追加しない
+- 入力にない RIC を作らない
+
+---
+
+# 14. Classification Notes
+
+## 14.1 `notes_for_classification`
+
+ニュース分類で注意すべき点を短く記載してください。
+
+例：
+
+```yaml
+notes_for_classification: >
+  このテーマでは、個別企業名が出ないニュースでも、半導体設備投資、
+  ファウンドリー投資、AI半導体需要、輸出規制に関するニュースは関連度を高く評価する。
+  一方、一般的なテクノロジー株ニュースや米国大型テック企業の決算だけの記事は、
+  日本の半導体製造装置需要との接続が弱い場合、関連度を低くする。
+```
+
+---
+
+# 15. 禁止事項
+
+以下を守ってください。
+
+- 入力データにない銘柄を追加しない
+- RIC を変更しない
+- ウェイトを変更しない
+- `theme_id` を変更しない
+- 企業説明にない事業を断定しない
+- 投資推奨文にしない
+- 「必ず上昇する」「恩恵を受ける」と断定しない
+- 抽象的すぎるキーワードを大量に入れない
+- 一般語だけで catalyst を作らない
+- ニュース分類に使えない美文にしない
+- 事実ではなく期待だけで説明を膨らませない
+
+---
+
+# 16. 許可される補完
+
+以下は許可します。
+
+- テーマ説明をニュース分類に適した形へ補強する
+- 英語説明から自然な日本語表現を作る
+- 日本語説明から自然な英語表現を作る
+- 企業説明・業種分類から収益ドライバーを推定する
+- 表記ゆれ・同義語を keyword に追加する
+- 重要なマクロ・政策要因を合理的に補完する
+- テーマが反応しやすい positive / negative event を定義する
+- 収益ドライバー単位に分解する
+
+---
+
+# 17. 品質チェック基準
+
+出力後、以下を満たしているか確認してください。
+
+## 17.1 テーマ説明
+
+- テーマ名の言い換えだけになっていない
+- 収益ドライバーが明確
+- ニュース分類に使える語彙が含まれている
+- 日本語・英語が整合している
+
+## 17.2 Revenue Drivers
+
+- 5〜12個程度ある
+- 各 driver が具体的
+- driver_type が適切
+- driver_embedding_text がニュース本文と意味類似を取りやすい
+- driver_keywords が具体的
+
+## 17.3 Catalysts / Keywords
+
+- 抽象語が多すぎない
+- ニュース見出しに出やすい語が多い
+- 日本語・英語の表記ゆれが含まれる
+- テーマ名だけに依存していない
+
+## 17.4 Events
+
+- positive / negative events がテーマに応じて妥当
+- マクロや政策の方向性が逆になるテーマでは注意されている  
+  例：金利上昇は銀行にはポジティブ、不動産にはネガティブ
+
+## 17.5 Entity Linking
+
+- RIC が変更されていない
+- 企業名が入力と整合している
+- aliases が過剰に追加されていない
+
+---
+
+# 18. 実行用プロンプト
+
+以下を ChatGPT / Codex / LLM に渡してください。
+
+```markdown
+あなたは日本株テーマ投資、金融ニュース分類、自然言語処理、クオンツ運用に詳しいリサーチャーです。
+
+以下の既存テーマ定義を、LSEG / Refinitiv ニュースを用いた Broad News + Revenue Driver Based Theme Rotation 戦略で利用できるように拡張してください。
+
+# 目的
+
+拡張後のテーマ定義は、以下に使います。
+
+1. Broadニュース本文との embedding 類似度計算
+2. 収益ドライバー単位の embedding 類似度計算
+3. ニュースからテーマへの多ラベル帰属
+4. Keyword Match による補正
+5. Tone 判定
+6. DriverBreadth の計算
+7. EntityBreadth の補助計算
+8. ThemeScore の算出
+
+# 入力
+
+以下の情報を与えます。
+
+- theme_id
+- theme_name_en
+- theme_name_ja
+- theme_description_en
+- theme_description_ja
+- 必要に応じて、構成銘柄情報
+- 必要に応じて、既存の catalysts / revenue drivers / keywords
+
+# 出力形式
+
+必ず以下の YAML 形式のみで出力してください。
+
+```yaml
+themes:
+  - theme_id: ""
+    theme_name_en: ""
+    theme_name_ja: ""
+    theme_type: ""
+
+    description_en: ""
+    description_ja: ""
+
+    profile_summary_en: ""
+    profile_summary_ja: ""
+
+    revenue_drivers:
+      - driver_id: ""
+        driver_name_en: ""
+        driver_name_ja: ""
+        driver_type: ""
+        driver_description_en: ""
+        driver_description_ja: ""
+        driver_embedding_text: ""
+        driver_keywords_en:
+          - ""
+        driver_keywords_ja:
+          - ""
+        positive_driver_events_en:
+          - ""
+        positive_driver_events_ja:
+          - ""
+        negative_driver_events_en:
+          - ""
+        negative_driver_events_ja:
+          - ""
+
+    catalysts_en:
+      - ""
+    catalysts_ja:
+      - ""
+
+    positive_events_en:
+      - ""
+    positive_events_ja:
+      - ""
+
+    negative_events_en:
+      - ""
+    negative_events_ja:
+      - ""
+
+    related_macro_factors_en:
+      - ""
+    related_macro_factors_ja:
+      - ""
+
+    related_policy_factors_en:
+      - ""
+    related_policy_factors_ja:
+      - ""
+
+    related_industries:
+      gics_sectors:
+        - ""
+      gics_industries:
+        - ""
+      trbc_industries:
+        - ""
+
+    keyword_match_terms_en:
+      - ""
+    keyword_match_terms_ja:
+      - ""
+
+    embedding_text: ""
+
+    entity_linking_terms:
+      rics:
+        - ""
+      company_names_en:
+        - ""
+      company_names_ja:
+        - ""
+      aliases_en:
+        - ""
+      aliases_ja:
+        - ""
+
+    notes_for_classification: ""
+```
+
+# 作成ルール
+
+## theme_id
+入力の theme_id をそのまま使ってください。変更しないでください。
+
+## theme_name_en / theme_name_ja
+入力を尊重してください。日本語名がない場合のみ自然に補完してください。
+
+## theme_type
+以下から1つ選んでください。
+
+- industry_theme
+- style_theme
+- policy_theme
+- macro_theme
+- event_theme
+- industry_policy_theme
+- macro_style_theme
+
+## description_en / description_ja
+3〜6文で、テーマの投資対象、収益ドライバー、ニュース分類で検出すべき論点を説明してください。
+
+## profile_summary_en / profile_summary_ja
+1〜2文で、何にエクスポージャーを取るテーマかを簡潔にまとめてください。
+
+## revenue_drivers
+各テーマにつき5〜12個作成してください。
+テーマを「収益ドライバーの集合」として分解してください。
+
+各 driver には以下を必ず含めてください。
+
+- driver_id
+- driver_name_en
+- driver_name_ja
+- driver_type
+- driver_description_en
+- driver_description_ja
+- driver_embedding_text
+- driver_keywords_en
+- driver_keywords_ja
+- positive_driver_events_en
+- positive_driver_events_ja
+- negative_driver_events_en
+- negative_driver_events_ja
+
+driver_type は以下から選んでください。
+
+- demand_driver
+- supply_driver
+- capex_driver
+- policy_driver
+- macro_driver
+- valuation_driver
+- shareholder_return_driver
+- earnings_driver
+- technology_driver
+- regulatory_driver
+- event_driver
+
+## driver_embedding_text
+ニュース本文との embedding 類似度に直接使います。
+日本語と英語を両方含め、ニュースに出やすい表現を入れてください。
+
+## catalysts_en / catalysts_ja
+各言語10〜30個作成してください。
+ニュース見出し・本文に出やすい名詞句を中心にしてください。
+抽象語を避け、具体的な語句にしてください。
+
+## positive_events / negative_events
+テーマ全体に対してポジティブ・ネガティブと解釈されやすいイベントを各5〜15個作成してください。
+
+## related_macro_factors / related_policy_factors
+関係する場合のみ列挙してください。関係が薄い場合は空リストで構いません。
+
+## related_industries
+構成銘柄情報がある場合、GICS / TRBC を集約してください。
+重複は除去し、最大10個程度にしてください。
+
+## keyword_match_terms
+catalysts、revenue driver keywords、positive/negative events、macro/policy factors を統合してください。
+各言語20〜50語を目安にしてください。
+単体では広すぎる語は避けてください。
+
+## embedding_text
+テーマ全体の embedding に使う文章です。
+日本語と英語を両方含め、テーマ名、説明、収益ドライバー、カタリスト、マクロ・政策要因、主要構成銘柄の特徴を統合してください。
+
+## entity_linking_terms
+構成銘柄情報がある場合のみ作成してください。
+RIC、企業名は入力値を変更しないでください。
+aliases は明らかに一般的な略称のみ追加してください。
+
+## notes_for_classification
+ニュース分類時の注意点を記載してください。
+たとえば「個別企業名が出ないニュースでも、設備投資や政策支援に関する報道は関連度を高く評価する」などです。
+
+# 禁止事項
+
+- 入力データにない銘柄を追加しない
+- RIC を変更しない
+- ウェイトを変更しない
+- theme_id を変更しない
+- 企業説明にない事業を断定しない
+- 投資推奨文にしない
+- 「必ず上昇する」「恩恵を受ける」と断定しない
+- 抽象的すぎる keyword を大量に入れない
+- ニュース分類に使えない美文にしない
+
+# 出力
+解説文は不要です。
+YAML のみを出力してください。
+```
+
+---
+
+# 19. 分割実行用プロンプト
+
+テーマ数が多い場合は、10〜20テーマずつ分割してください。
+
+```markdown
+テーマ数が多いため、今回の対象は以下の theme_id のみです。
+
+対象 theme_id:
+- xxx
+- yyy
+- zzz
+
+対象外のテーマは出力しないでください。
+```
+
+---
+
+# 20. レビュー用プロンプト
+
+作成されたテーマ定義を別の ChatGPT にレビューさせる場合は以下を使ってください。
+
+```markdown
+以下の拡張済み theme definition YAML をレビューしてください。
+
+観点:
+
+1. theme_id が入力から変更されていないか
+2. theme_type は妥当か
+3. description はテーマ名の言い換えに留まっていないか
+4. revenue_drivers は5〜12個程度あり、具体的な収益ドライバーになっているか
+5. driver_embedding_text はニュース本文との意味類似に使えるか
+6. driver_keywords はニュースに出やすい語句になっているか
+7. catalysts は抽象的すぎないか
+8. positive_events / negative_events はテーマごとに妥当か
+9. related_macro_factors / related_policy_factors が過剰または不足していないか
+10. keyword_match_terms に「成長」「市場」「需要」などの抽象語が多すぎないか
+11. embedding_text は日本語・英語の両方を含み、テーマ全体を適切に表現しているか
+12. entity_linking_terms の RIC や企業名が入力と整合しているか
+13. notes_for_classification はニュース分類時の注意点として有用か
+
+問題があれば、修正案を YAML patch 形式で示してください。
+```
+
+---
+
+この指示書で作成した拡張 theme definition は、新手法における以下の中核入力になります。
+
+```text
+theme embedding
+driver embedding
+keyword match
+tone dictionary
+DriverBreadth
+EntityBreadth
+ThemeScore
+```
+
+特に重要なのは、`revenue_drivers` と `driver_embedding_text` です。  
+この2つの品質が、Broadニュースからテーマの盛り上がりを拾えるかどうかを大きく左右します。
+
+## Response:
+2026/4/29 23:38:01
+
+以下をそのまま貼って使えます。
+
+```markdown
+あなたは日本株テーマ投資、金融ニュース分類、自然言語処理、クオンツ運用に詳しいリサーチャーです。
+
+以下の既存テーマ定義を、LSEG / Refinitiv ニュースを用いた Broad News + Revenue Driver Based Theme Rotation 戦略で利用できるように拡張してください。
+
+# 目的
+
+拡張後のテーマ定義は、以下に使います。
+
+1. Broadニュース本文との embedding 類似度計算
+2. 収益ドライバー単位の embedding 類似度計算
+3. ニュースからテーマへの多ラベル帰属
+4. Keyword Match による補正
+5. Tone 判定
+6. DriverBreadth の計算
+7. EntityBreadth の補助計算
+8. ThemeScore の算出
+
+# 入力
+
+以下の情報を与えます。
+
+- theme_id
+- theme_name_en
+- theme_name_ja
+- theme_description_en
+- theme_description_ja
+- 必要に応じて、構成銘柄情報
+- 必要に応じて、既存の catalysts / revenue drivers / keywords
+
+# 出力形式
+
+必ず以下の YAML 形式のみで出力してください。
+
+```yaml
+themes:
+  - theme_id: ""
+    theme_name_en: ""
+    theme_name_ja: ""
+    theme_type: ""
+
+    description_en: ""
+    description_ja: ""
+
+    profile_summary_en: ""
+    profile_summary_ja: ""
+
+    revenue_drivers:
+      - driver_id: ""
+        driver_name_en: ""
+        driver_name_ja: ""
+        driver_type: ""
+        driver_description_en: ""
+        driver_description_ja: ""
+        driver_embedding_text: ""
+        driver_keywords_en:
+          - ""
+        driver_keywords_ja:
+          - ""
+        positive_driver_events_en:
+          - ""
+        positive_driver_events_ja:
+          - ""
+        negative_driver_events_en:
+          - ""
+        negative_driver_events_ja:
+          - ""
+
+    catalysts_en:
+      - ""
+    catalysts_ja:
+      - ""
+
+    positive_events_en:
+      - ""
+    positive_events_ja:
+      - ""
+
+    negative_events_en:
+      - ""
+    negative_events_ja:
+      - ""
+
+    related_macro_factors_en:
+      - ""
+    related_macro_factors_ja:
+      - ""
+
+    related_policy_factors_en:
+      - ""
+    related_policy_factors_ja:
+      - ""
+
+    related_industries:
+      gics_sectors:
+        - ""
+      gics_industries:
+        - ""
+      trbc_industries:
+        - ""
+
+    keyword_match_terms_en:
+      - ""
+    keyword_match_terms_ja:
+      - ""
+
+    embedding_text: ""
+
+    entity_linking_terms:
+      rics:
+        - ""
+      company_names_en:
+        - ""
+      company_names_ja:
+        - ""
+      aliases_en:
+        - ""
+      aliases_ja:
+        - ""
+
+    notes_for_classification: ""
+```
+
+# 作成ルール
+
+## theme_id
+
+入力の theme_id をそのまま使ってください。変更しないでください。
+
+## theme_name_en / theme_name_ja
+
+入力を尊重してください。日本語名がない場合のみ自然に補完してください。
+
+## theme_type
+
+以下から1つ選んでください。
+
+- industry_theme
+- style_theme
+- policy_theme
+- macro_theme
+- event_theme
+- industry_policy_theme
+- macro_style_theme
+
+判断基準:
+
+| theme_type | 判断基準 | 例 |
+|---|---|---|
+| industry_theme | 産業、業種、技術、サプライチェーンが主軸 | 半導体、AI、電力インフラ、医療機器 |
+| style_theme | バリュエーション、財務特性、株主還元が主軸 | 低PBR、高配当、クオリティ |
+| policy_theme | 政策、規制、政府支出、補助金が主軸 | 防衛、GX、国土強靭化 |
+| macro_theme | 金利、為替、資源価格、景気が主軸 | 円安メリット、資源高、インフレ |
+| event_theme | M&A、自社株買い、決算、承認などが主軸 | TOB、自社株買い、薬事承認 |
+| industry_policy_theme | 産業テーマと政策テーマの両方 | 防衛、半導体国内生産、電力網 |
+| macro_style_theme | マクロ環境とスタイル特性の両方 | 地銀・金利上昇メリット、インフレ耐性高配当 |
+
+## description_en / description_ja
+
+3〜6文で、テーマの投資対象、収益ドライバー、ニュース分類で検出すべき論点を説明してください。
+
+必ず以下を含めてください。
+
+- 投資対象の概要
+- 主な収益ドライバー
+- ニュースで検出すべき論点
+- 構成銘柄情報がある場合は、その実態
+- テーマが反応しやすいマクロ・政策・産業イベント
+
+悪い例:
+
+```yaml
+description_ja: "AI関連企業に投資するテーマ。"
+```
+
+良い例:
+
+```yaml
+description_ja: >
+  このテーマは、生成AI、AI半導体、データセンター、クラウド基盤、
+  産業用AIソフトウェア、電子部品、半導体製造装置に関連する日本株を対象とする。
+  主な収益ドライバーは、AIサーバー需要、データセンター投資、
+  半導体設備投資、企業のDX投資、クラウド利用拡大である。
+  ニュース分類では、GPU需要、AI設備投資、半導体受注、データセンター増設、
+  ハイパースケーラーの投資計画などを重視する。
+```
+
+## profile_summary_en / profile_summary_ja
+
+1〜2文で、何にエクスポージャーを取るテーマかを簡潔にまとめてください。
+
+## revenue_drivers
+
+各テーマにつき5〜12個作成してください。
+
+テーマを「収益ドライバーの集合」として分解してください。
+
+各 driver には以下を必ず含めてください。
+
+- driver_id
+- driver_name_en
+- driver_name_ja
+- driver_type
+- driver_description_en
+- driver_description_ja
+- driver_embedding_text
+- driver_keywords_en
+- driver_keywords_ja
+- positive_driver_events_en
+- positive_driver_events_ja
+- negative_driver_events_en
+- negative_driver_events_ja
+
+## driver_id
+
+以下の形式で作成してください。
+
+```yaml
+driver_id: "<theme_id>__driver_001"
+```
+
+例:
+
+```yaml
+driver_id: "semiconductor_equipment_jp__driver_001"
+```
+
+## driver_type
+
+以下から1つ選んでください。
+
+- demand_driver
+- supply_driver
+- capex_driver
+- policy_driver
+- macro_driver
+- valuation_driver
+- shareholder_return_driver
+- earnings_driver
+- technology_driver
+- regulatory_driver
+- event_driver
+
+判断基準:
+
+| driver_type | 内容 |
+|---|---|
+| demand_driver | 最終需要、販売量、利用拡大 |
+| supply_driver | 供給制約、在庫、サプライチェーン |
+| capex_driver | 設備投資、建設投資、投資サイクル |
+| policy_driver | 政策支援、補助金、政府支出 |
+| macro_driver | 金利、為替、資源価格、景気 |
+| valuation_driver | PBR、PER、資本効率、割安修正 |
+| shareholder_return_driver | 自社株買い、増配、配当方針 |
+| earnings_driver | 業績修正、受注、利益率、決算 |
+| technology_driver | 技術革新、製品サイクル |
+| regulatory_driver | 規制、承認、輸出管理 |
+| event_driver | M&A、TOB、訴訟、災害、事故 |
+
+## driver_embedding_text
+
+ニュース本文との embedding 類似度に直接使います。
+
+日本語と英語を両方含め、ニュースに出やすい表現を入れてください。
+
+例:
+
+```yaml
+driver_embedding_text: >
+  Semiconductor capital expenditure cycle. 半導体設備投資サイクル。
+  Wafer fab investment, foundry capex, AI semiconductor investment,
+  memory capacity expansion, semiconductor equipment orders,
+  半導体製造装置受注、ファウンドリー投資、AI半導体設備投資。
+```
+
+## driver_keywords_en / driver_keywords_ja
+
+各 driver について、ニュース見出し・本文に出やすい具体的な語句を作成してください。
+
+目安:
+
+- 各 driver につき英語5〜15語
+- 各 driver につき日本語5〜15語
+- 名詞句中心
+- 抽象語を避ける
+
+## positive_driver_events / negative_driver_events
+
+各 driver に対して、ポジティブ・ネガティブに解釈されやすいイベントを作成してください。
+
+例:
+
+```yaml
+positive_driver_events_ja:
+  - 設備投資増額
+  - 受注回復
+  - ファウンドリー投資拡大
+  - メモリ価格回復
+
+negative_driver_events_ja:
+  - 設備投資削減
+  - 受注減少
+  - 投資延期
+  - 輸出規制
+```
+
+## catalysts_en / catalysts_ja
+
+各言語10〜30個作成してください。
+
+ニュース見出し・本文に出やすい名詞句を中心にしてください。
+
+テーマ名そのものだけに依存しないでください。
+
+抽象語を避け、具体的な語句にしてください。
+
+悪い例:
+
+```yaml
+catalysts_ja:
+  - 成長
+  - 市場
+  - 需要
+  - 投資
+```
+
+良い例:
+
+```yaml
+catalysts_ja:
+  - 半導体設備投資
+  - 半導体製造装置受注
+  - AI半導体
+  - ファウンドリー投資
+  - メモリ市況
+  - 輸出規制
+  - データセンター投資
+```
+
+## positive_events_en / positive_events_ja
+
+テーマ全体に対してポジティブと解釈されやすいイベントを5〜15個作成してください。
+
+例:
+
+```yaml
+positive_events_ja:
+  - 上方修正
+  - 受注増加
+  - 設備投資増額
+  - 自社株買い発表
+  - 増配
+  - 補助金採択
+  - 規制承認
+  - 価格上昇
+```
+
+## negative_events_en / negative_events_ja
+
+テーマ全体に対してネガティブと解釈されやすいイベントを5〜15個作成してください。
+
+例:
+
+```yaml
+negative_events_ja:
+  - 下方修正
+  - 受注減少
+  - 設備投資延期
+  - 減配
+  - 公募増資
+  - 輸出規制
+  - 行政処分
+  - 訴訟
+  - コスト増
+```
+
+## related_macro_factors_en / related_macro_factors_ja
+
+テーマに影響するマクロ要因を列挙してください。
+
+例:
+
+```yaml
+related_macro_factors_ja:
+  - 国内金利
+  - 長期金利
+  - 米ドル円
+  - 半導体サイクル
+  - 設備投資サイクル
+  - 原油価格
+  - 電力価格
+```
+
+関係が薄い場合は空リストで構いません。
+
+```yaml
+related_macro_factors_ja: []
+related_macro_factors_en: []
+```
+
+## related_policy_factors_en / related_policy_factors_ja
+
+政策・規制・政府支出・補助金・制度改革に関係する要因を列挙してください。
+
+例:
+
+```yaml
+related_policy_factors_ja:
+  - 防衛予算
+  - 半導体補助金
+  - GX政策
+  - 電力系統投資
+  - 東証による資本効率改善要請
+  - 経済安全保障
+```
+
+関係が薄い場合は空リストで構いません。
+
+## related_industries
+
+構成銘柄情報がある場合、GICS / TRBC を集約してください。
+
+```yaml
+related_industries:
+  gics_sectors:
+    - "Information Technology"
+    - "Industrials"
+  gics_industries:
+    - "Semiconductors & Semiconductor Equipment"
+    - "Electronic Equipment, Instruments & Components"
+  trbc_industries:
+    - "Semiconductor Equipment"
+    - "Electronic Equipment & Parts"
+```
+
+ルール:
+
+- 重複を除去する
+- ウェイト上位または出現頻度が高いものを優先
+- 最大10個程度に抑える
+- 入力データにある表記を尊重する
+
+## keyword_match_terms_en / keyword_match_terms_ja
+
+ニュースのキーワード一致スコアに使う語句です。
+
+以下を統合してください。
+
+- catalysts
+- revenue driver keywords
+- positive events
+- negative events
+- macro factors
+- policy factors
+- 業界用語
+- 表記ゆれ
+
+各言語20〜50語を目安にしてください。
+
+単体では広すぎる語は避けてください。
+
+避けるべき例:
+
+```text
+成長
+市場
+需要
+投資
+企業
+事業
+株価
+材料
+```
+
+使うなら具体化してください。
+
+```text
+AI需要
+データセンター投資
+半導体設備投資
+防衛予算
+資本効率改善
+自社株買い発表
+```
+
+## embedding_text
+
+テーマ全体の embedding に使う文章です。
+
+必ず以下を含めてください。
+
+- theme_name_en
+- theme_name_ja
+- description_en
+- description_ja
+- profile_summary_en
+- profile_summary_ja
+- revenue drivers の要約
+- catalysts の要約
+- related macro / policy factors
+- 構成銘柄がある場合は、主要構成銘柄の特徴
+
+作成ルール:
+
+- 日本語と英語を両方含める
+- ニュース本文に近い語彙を含める
+- 長すぎないようにする
+- 構成銘柄説明を入れる場合は、上位30社または累積80%まで
+- 一企業だけに過度に寄せない
+
+## entity_linking_terms
+
+構成銘柄情報がある場合のみ作成してください。
+
+```yaml
+entity_linking_terms:
+  rics:
+    - "8035.T"
+    - "6857.T"
+  company_names_en:
+    - "Tokyo Electron"
+    - "Advantest"
+  company_names_ja:
+    - "東京エレクトロン"
+    - "アドバンテスト"
+  aliases_en:
+    - "TEL"
+  aliases_ja:
+    - "東エレク"
+```
+
+ルール:
+
+- RIC は入力値を変更しない
+- 企業名は入力値を尊重する
+- aliases は、明らかに一般的な略称のみ追加する
+- 勝手に企業を追加しない
+- 入力にない RIC を作らない
+
+## notes_for_classification
+
+ニュース分類時の注意点を短く記載してください。
+
+例:
+
+```yaml
+notes_for_classification: >
+  このテーマでは、個別企業名が出ないニュースでも、半導体設備投資、
+  ファウンドリー投資、AI半導体需要、輸出規制に関するニュースは関連度を高く評価する。
+  一方、一般的なテクノロジー株ニュースや米国大型テック企業の決算だけの記事は、
+  日本の半導体製造装置需要との接続が弱い場合、関連度を低くする。
+```
+
+# 禁止事項
+
+以下を守ってください。
+
+- 入力データにない銘柄を追加しない
+- RIC を変更しない
+- ウェイトを変更しない
+- theme_id を変更しない
+- 企業説明にない事業を断定しない
+- 投資推奨文にしない
+- 「必ず上昇する」「恩恵を受ける」と断定しない
+- 抽象的すぎる keyword を大量に入れない
+- 一般語だけで catalyst を作らない
+- ニュース分類に使えない美文にしない
+- 事実ではなく期待だけで説明を膨らませない
+
+# 許可される補完
+
+以下は許可します。
+
+- テーマ説明をニュース分類に適した形へ補強する
+- 英語説明から自然な日本語表現を作る
+- 日本語説明から自然な英語表現を作る
+- 企業説明・業種分類から収益ドライバーを推定する
+- 表記ゆれ・同義語を keyword に追加する
+- 重要なマクロ・政策要因を合理的に補完する
+- テーマが反応しやすい positive / negative event を定義する
+- 収益ドライバー単位に分解する
+
+# 品質基準
+
+出力後、以下を満たしているか確認してください。
+
+## テーマ説明
+
+- テーマ名の言い換えだけになっていない
+- 収益ドライバーが明確
+- ニュース分類に使える語彙が含まれている
+- 日本語・英語が整合している
+
+## Revenue Drivers
+
+- 5〜12個程度ある
+- 各 driver が具体的
+- driver_type が適切
+- driver_embedding_text がニュース本文との意味類似に使える
+- driver_keywords が具体的
+
+## Catalysts / Keywords
+
+- 抽象語が多すぎない
+- ニュース見出しに出やすい語が多い
+- 日本語・英語の表記ゆれが含まれる
+- テーマ名だけに依存していない
+
+## Events
+
+- positive / negative events がテーマごとに妥当
+- マクロや政策の方向性が逆になるテーマでは注意されている
+  例: 金利上昇は銀行にはポジティブ、不動産にはネガティブ
+
+## Entity Linking
+
+- RIC が変更されていない
+- 企業名が入力と整合している
+- aliases が過剰に追加されていない
+
+# 分割実行する場合
+
+テーマ数が多い場合は、10〜20テーマずつ分割してください。
+
+その場合、以下のように対象テーマを明示します。
+
+```markdown
+テーマ数が多いため、今回の対象は以下の theme_id のみです。
+
+対象 theme_id:
+- xxx
+- yyy
+- zzz
+
+対象外のテーマは出力しないでください。
+```
+
+# 出力
+
+解説文は不要です。
+
+YAML のみを出力してください。
+```
+
+## Response:
+2026/4/29 23:45:00
+
+指示書を Markdown ファイルとして保存します。前回の貼り付け用プロンプトをそのまま再利用できる形で出力します。
+
+作成しました。こちらからダウンロードできます。
+
+[theme_definition_expansion_prompt.md](sandbox:/mnt/data/theme_definition_expansion_prompt.md)
+
+## Response:
+2026/4/29 23:46:28
+
+> **プロジェクトファイルの作成**
+>
+>
+> **Creating configuration files**
+>
+>
+> **生成ファイルの作成**
+>
+>
+> **Creating theme and driver profiles**
+>
+>
+> **Generating news storage files**
+>
+>
+> **ファイルの続き作成**
+>
+>
+> **Creating features, portfolio, and reporting pipeline**
+>
+>
+> **実行パイプラインの構築**
+>
+>
+> **Creating and testing Jupyter notebook**
+>
+>
+> **実行パイプラインのタイムアウト確認**
+>
+>
+> **デバッグしてスクリプト実行確認**
+>
+>
+> **プロセス確認 중**
+>
+>
+> **実行確認のための簡単なスクリプト**
+>
+>
+> **確認中のPython実行環境**
+>
+>
+> **テスト用に/usr/bin/python3を実行**
+>
+>
+> **まとめてZIPファイル作成**
+>
+>
+> 思考時間: 3m 46s
+
+フルコードは長くなるため、再現実装用のプロジェクト一式として生成します。Broadニュース取得、driver profile、driver-based linking、特徴量、Top4ウェイト、可視化まで含めます。
+
+作成しました。Broadニュース取得 + 収益ドライバー単位のテーマ帰属に基づくフルコード一式です。
+
+[theme_news_driver_based_full.zip](sandbox:/mnt/data/theme_news_driver_based_full.zip)
+
+含めた主な内容は以下です。
+
+```text
+theme_news_driver_based_full/
+├─ README.md
+├─ AGENTS.md
+├─ requirements_notes.md
+├─ main_driver_based.ipynb
+├─ configs/
+│  ├─ config.yaml
+│  ├─ lseg_queries.yaml
+│  └─ theme_profiles.yaml
+├─ scripts/
+│  └─ run_pipeline.py
+└─ src/theme_news_driver_based/
+   ├─ config.py
+   ├─ io_utils.py
+   ├─ text_utils.py
+   ├─ news_loader.py
+   ├─ theme_profile.py
+   ├─ embeddings.py
+   ├─ driver_linker.py
+   ├─ sentiment.py
+   ├─ features_driver_based.py
+   ├─ portfolio.py
+   ├─ reporting.py
+   └─ pipeline.py
+```
+
+初期状態では `configs/config.yaml` が以下になっているため、LSEGなしでも mock データで疎通確認できます。
+
+```yaml
+news:
+  mode: mock
+
+embedding:
+  backend: tfidf
+```
+
+LSEGを使う場合は次に変更してください。
+
+```yaml
+news:
+  mode: lseg
+```
+
+ローカルの SentenceTransformer モデルを使う場合は次に変更します。
+
+```yaml
+embedding:
+  backend: sentence_transformers
+  model_name: data/model/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+実行はプロジェクトルートで以下です。
+
+```bash
+~/workspace/envs/base/.venv/bin/python scripts/run_pipeline.py
+```
+
+出力は以下に保存されます。
+
+```text
+data/interim/news_driver_links.pkl
+data/interim/news_theme_links.pkl
+data/processed/theme_news_features_daily.pkl
+data/processed/theme_weights.pkl
+outputs/tables/theme_scores_latest.csv
+outputs/figures/theme_score_timeseries_top10.png
+outputs/figures/selected_theme_heatmap.png
 ```
 
 
