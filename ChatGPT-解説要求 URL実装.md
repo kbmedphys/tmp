@@ -2,8 +2,8 @@
 
 **User:** Anonymous  
 **Created:** 7/27/2026 21:06:58  
-**Updated:** 8/5/2026 19:11:07  
-**Exported:** 8/5/2026 20:00:41  
+**Updated:** 8/5/2026 20:12:14  
+**Exported:** 8/5/2026 20:37:32  
 **Link:** [https://chatgpt.com/c/6a6749e1-049c-83ee-8937-a30a66c224d6](https://chatgpt.com/c/6a6749e1-049c-83ee-8937-a30a66c224d6)  
 
 ## Response:
@@ -11981,6 +11981,877 @@ intensity/* partition
 
 point_in_time/as_of=*
     = 特定時点で利用可能だった歴史系列
+```
+
+## Response:
+2026/8/5 20:06:57
+
+> **設計を整理する**
+>
+> 週次実行では影響分だけ返し、正規ストアが最新全体を保持する前提で考えている。再起動後は設定からストアを再構築できるが、分類エポックは一致させる必要があるため、メタデータや既存ディレクトリから安全に解決する補助関数も検討している。
+>
+> **整理された設計**
+>
+> 
+>
+> **読み込み方を決める**
+>
+> 週次結果は変更なしの場合に空になるため、常に正規ストアから最新状態を読み込む設計にする。現在値、履歴、実行スナップショットを分け、再起動後も同じ分類エポックを解決できるローダーを用意する。
+>
+> **読み込み方法を決定した**
+>
+> 
+>
+> **実装方針を固める**
+>
+> 私は、累積ストアを唯一の正規状態として扱い、週次結果や実行スナップショットには依存しない構成にする。再起動時は同じ設定から分類エポックを復元し、現在値と履歴をストアから読み込む。
+>
+> **実装方針を確定した**
+>
+> 
+>
+> **読み込み処理を設計する**
+>
+> 私は、最新改訂系列を日次・月次データから抽出し、必要なら横持ち化する。記事単位の現在値は状態データベースから、過去時点の値は時点指定の系列生成処理から取得する。
+> 
+> 変更なしの週次結果は空になり得るため、結果オブジェクトではなく、毎回正規ストアを読み込む設計にする。
+>
+> **設計した読み込み処理**
+>
+> 
+>
+> 5m 11s考えました
+
+はい。`initial_full`を1回、その後に`weekly_incremental`を何回実行しても、**同一の`store_root`・`classification_epoch`配下に累積保存されます**。最後の週次実行結果だけを過去の結果へ連結する必要はありません。
+
+重要なのは次の区別です。
+
+```text
+run_fixed_narrative_update() の返り値
+    = そのrunで新規計算・再計算された範囲
+
+FixedNarrativeStoreのpartition
+    = initial_full以降、複数回のweekly_incrementalを反映した
+      全期間の最新状態
+```
+
+論文が利用するNarrative Intensityも、長期間にわたって収集された記事から継続的に構築される時系列です。`Narrative Momentum.pdf`
+
+# 1. 複数回の実行例
+
+すべての実行で、同じ`PRODUCTION_CONFIG`を使用します。
+
+```python
+# 初回：過去全期間
+initial_result = run_fixed_narrative_update(
+    historical_articles_df,
+    PRODUCTION_CONFIG,
+    run_mode="initial_full",
+)
+
+# 第1回週次更新
+weekly_result_1 = run_fixed_narrative_update(
+    weekly_articles_df_1,
+    PRODUCTION_CONFIG,
+    run_mode="weekly_incremental",
+)
+
+# 第2回週次更新
+weekly_result_2 = run_fixed_narrative_update(
+    weekly_articles_df_2,
+    PRODUCTION_CONFIG,
+    run_mode="weekly_incremental",
+)
+
+# 第3回週次更新
+weekly_result_3 = run_fixed_narrative_update(
+    weekly_articles_df_3,
+    PRODUCTION_CONFIG,
+    run_mode="weekly_incremental",
+)
+```
+
+または、週次DataFrameをリストで保持している場合は次のように実行できます。
+
+```python
+weekly_results = []
+
+for weekly_df in weekly_article_batches:
+    result = run_fixed_narrative_update(
+        weekly_df,
+        PRODUCTION_CONFIG,
+        run_mode="weekly_incremental",
+    )
+    weekly_results.append(result)
+
+last_result = weekly_results[-1]
+```
+
+実行後のCanonical Storeは、次のような状態です。
+
+```text
+initial_full
+    ├─ 2024-01-01
+    ├─ 2024-01-02
+    └─ ...
+
+weekly_incremental #1
+    ├─ 新しい日付partitionを追加
+    └─ 訂正対象partitionを置換
+
+weekly_incremental #2
+    ├─ さらに新しい日付partitionを追加
+    └─ 必要な週・月を再計算
+
+weekly_incremental #3
+    └─ 全期間Storeの最新状態を更新
+```
+
+日次、週次、月次、signalは`classification_epoch`別のpartitionとして保存されます。`02_fixed_narrative_intensity_incremental_memory_safe_implemented_japanese_polarity_xlsx.ipynb`
+
+# 2. 複数回実行後に参照すべきデータ
+
+例えば、第3回の週次更新後に、
+
+```python
+weekly_result_3.daily_aggregate
+```
+
+を参照しても、入っているのは基本的に**第3回の更新で影響を受けた日だけ**です。
+
+全期間を取得する場合は、
+
+```python
+weekly_result_3.daily_aggregate
+```
+
+ではなく、
+
+```python
+FixedNarrativeStore
+```
+
+から全partitionを読み込みます。
+
+各runの保存先である、
+
+```text
+fixed_narratives/runs/<run_id>/
+```
+
+は、そのrunで処理した範囲の監査用スナップショットです。`daily_intensity`、`monthly_intensity`などもrun単位で保存されますが、全期間マスターではありません。`02_fixed_narrative_intensity_incremental_memory_safe_implemented_japanese_polarity_xlsx.ipynb`
+
+# 3. 全期間をロードする関数
+
+以下をNotebookの後段に追加してください。
+
+```python
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Sequence
+
+import pandas as pd
+
+def load_all_store_partitions(
+    store: FixedNarrativeStore,
+    base_dir: Path,
+    partition_col: str,
+    *,
+    key_cols: Sequence[str],
+    sort_cols: Sequence[str],
+) -> pd.DataFrame:
+    """
+    FixedNarrativeStoreの指定directoryから全partitionを読み込み、
+    business keyで最新行を一意化する。
+
+    Parameters
+    ----------
+    store:
+        FixedNarrativeStore。
+    base_dir:
+        daily_aggregate_dir、monthly_dir等。
+    partition_col:
+        date、week_end_wednesday、month、formation_month等。
+    key_cols:
+        重複排除に使うbusiness key。
+    sort_cols:
+        最終的な並び順。
+    """
+    frames: list[pd.DataFrame] = []
+
+    for _, frame in store.iter_partitions(
+        base_dir,
+        partition_col,
+    ):
+        if not frame.empty:
+            frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame()
+
+    result = pd.concat(
+        frames,
+        ignore_index=True,
+        sort=False,
+    )
+
+    valid_sort_cols = [
+        col for col in sort_cols
+        if col in result.columns
+    ]
+    if valid_sort_cols:
+        result = result.sort_values(
+            valid_sort_cols,
+            kind="stable",
+        )
+
+    valid_key_cols = [
+        col for col in key_cols
+        if col in result.columns
+    ]
+    if valid_key_cols:
+        result = result.drop_duplicates(
+            valid_key_cols,
+            keep="last",
+        )
+
+    return result.reset_index(drop=True)
+
+def load_full_narrative_intensity_history(
+    *,
+    store_root: str | Path,
+    classification_epoch: str,
+) -> dict[str, pd.DataFrame]:
+    """
+    initial_fullと複数回のweekly_incrementalを反映した、
+    全期間の最新Canonical系列をロードする。
+    """
+    store = FixedNarrativeStore(
+        store_root,
+        classification_epoch,
+    )
+
+    daily_by_reservoir = load_all_store_partitions(
+        store,
+        store.daily_reservoir_dir,
+        "date",
+        key_cols=[
+            "date",
+            "reservoir",
+            "narrative_id",
+            "series_type",
+        ],
+        sort_cols=[
+            "date",
+            "reservoir",
+            "narrative_id",
+            "series_type",
+        ],
+    )
+
+    daily_aggregate = load_all_store_partitions(
+        store,
+        store.daily_aggregate_dir,
+        "date",
+        key_cols=[
+            "date",
+            "narrative_id",
+            "series_type",
+        ],
+        sort_cols=[
+            "date",
+            "narrative_id",
+            "series_type",
+        ],
+    )
+
+    weekly = load_all_store_partitions(
+        store,
+        store.weekly_dir,
+        "week_end_wednesday",
+        key_cols=[
+            "week_end_wednesday",
+            "narrative_id",
+            "series_type",
+        ],
+        sort_cols=[
+            "week_end_wednesday",
+            "narrative_id",
+            "series_type",
+        ],
+    )
+
+    monthly = load_all_store_partitions(
+        store,
+        store.monthly_dir,
+        "month",
+        key_cols=[
+            "month",
+            "narrative_id",
+            "series_type",
+            "monthly_variant",
+        ],
+        sort_cols=[
+            "month",
+            "monthly_variant",
+            "narrative_id",
+            "series_type",
+        ],
+    )
+
+    signals = load_all_store_partitions(
+        store,
+        store.signal_dir,
+        "formation_month",
+        key_cols=[
+            "formation_month",
+            "narrative_id",
+            "lookback_months",
+            "series_type",
+        ],
+        sort_cols=[
+            "formation_month",
+            "lookback_months",
+            "narrative_id",
+            "series_type",
+        ],
+    )
+
+    return {
+        "daily_by_reservoir": daily_by_reservoir,
+        "daily_aggregate": daily_aggregate,
+        "weekly": weekly,
+        "monthly": monthly,
+        "signals": signals,
+    }
+```
+
+Storeの`iter_partitions`は、存在するpartitionを順番に読み込みます。ファイルがParquetかPickleかはStore内部で吸収されます。`02_fixed_narrative_intensity_incremental_memory_safe_implemented_japanese_polarity_xlsx.ipynb`
+
+# 4. 最後の週次実行後にロードする
+
+最後の実行結果を利用できる場合は、次で十分です。
+
+```python
+full_history = load_full_narrative_intensity_history(
+    store_root=weekly_result_3.store_root,
+    classification_epoch=(
+        weekly_result_3.classification_epoch
+    ),
+)
+
+daily_by_reservoir_df = (
+    full_history["daily_by_reservoir"]
+)
+
+daily_aggregate_df = (
+    full_history["daily_aggregate"]
+)
+
+weekly_intensity_df = (
+    full_history["weekly"]
+)
+
+monthly_intensity_df = (
+    full_history["monthly"]
+)
+
+momentum_signals_df = (
+    full_history["signals"]
+)
+```
+
+何回weekly更新したかは、ロード方法に影響しません。
+
+```text
+initial_full 1回
++ weekly 3回
++ weekly 20回
++ weekly 100回
+```
+
+のいずれでも、最後に同じStoreを全partition読込すれば、全期間の最新状態が得られます。
+
+# 5. Python kernelを再起動した後のロード
+
+最後の`weekly_result_3`オブジェクトがメモリに残っていなくても問題ありません。
+
+同じ本番設定を再度作ります。
+
+```python
+cfg = finalize_config(
+    PRODUCTION_CONFIG
+)
+
+full_history = load_full_narrative_intensity_history(
+    store_root=cfg["store_root"],
+    classification_epoch=(
+        cfg["classification_epoch"]
+    ),
+)
+```
+
+ただし、以下は初回・全weekly実行・ロード時で同一である必要があります。
+
+```text
+store_root
+Registry
+rule version
+classifier version
+embedding設定
+日本語極性辞書
+sentiment設定
+text preprocessing version
+```
+
+これらが同じなら、`finalize_config()`が同じ`classification_epoch`を生成します。
+
+確認します。
+
+```python
+print(cfg["store_root"])
+print(cfg["classification_epoch"])
+```
+
+# 6. Storeからclassification epochを確認する方法
+
+設定が不明になった場合、SQLiteのmetadataから確認できます。
+
+```python
+from pathlib import Path
+
+store_root = Path(
+    PRODUCTION_CONFIG["store_root"]
+).expanduser().resolve()
+
+db_path = (
+    store_root
+    / "fixed_narratives"
+    / "state"
+    / "fixed_narrative.sqlite"
+)
+
+state = FixedNarrativeStateDB(
+    db_path,
+    journal_mode=PRODUCTION_CONFIG.get(
+        "sqlite_journal_mode",
+        "DELETE",
+    ),
+    synchronous=PRODUCTION_CONFIG.get(
+        "sqlite_synchronous",
+        "NORMAL",
+    ),
+    busy_timeout_ms=PRODUCTION_CONFIG.get(
+        "sqlite_busy_timeout_ms",
+        60_000,
+    ),
+    write_batch_articles=PRODUCTION_CONFIG.get(
+        "sqlite_write_batch_articles",
+        250,
+    ),
+)
+
+try:
+    classification_epoch = state.get_meta(
+        "classification_epoch"
+    )
+    registry_version = state.get_meta(
+        "registry_version"
+    )
+    watermark = state.get_meta(
+        "watermark"
+    )
+finally:
+    state.close()
+
+print({
+    "classification_epoch": classification_epoch,
+    "registry_version": registry_version,
+    "watermark": watermark,
+})
+```
+
+その後、
+
+```python
+full_history = load_full_narrative_intensity_history(
+    store_root=store_root,
+    classification_epoch=classification_epoch,
+)
+```
+
+とします。
+
+# 7. 最新改訂系列だけを取得する
+
+Canonical Storeは通常、
+
+```text
+series_type = latest_revised
+```
+
+を保持します。
+
+```python
+daily_latest = (
+    full_history["daily_aggregate"]
+    .loc[
+        lambda x:
+        x["series_type"].eq("latest_revised")
+    ]
+    .sort_values(
+        ["date", "narrative_id"],
+        kind="stable",
+    )
+    .reset_index(drop=True)
+)
+```
+
+Reservoir別の場合：
+
+```python
+daily_reservoir_latest = (
+    full_history["daily_by_reservoir"]
+    .loc[
+        lambda x:
+        x["series_type"].eq("latest_revised")
+    ]
+    .sort_values(
+        [
+            "date",
+            "reservoir",
+            "narrative_id",
+        ],
+        kind="stable",
+    )
+    .reset_index(drop=True)
+)
+```
+
+# 8. 月次系列の選択
+
+月次には2種類あります。
+
+```text
+monthly_variant = full
+monthly_variant = signal_cutoff
+```
+
+## 全日付を含む分析用
+
+```python
+monthly_full = (
+    full_history["monthly"]
+    .loc[
+        lambda x:
+        x["series_type"].eq("latest_revised")
+        &
+        x["monthly_variant"].eq("full")
+    ]
+    .sort_values(
+        ["month", "narrative_id"],
+        kind="stable",
+    )
+    .reset_index(drop=True)
+)
+```
+
+## Narrative Momentum形成用
+
+```python
+monthly_signal = (
+    full_history["monthly"]
+    .loc[
+        lambda x:
+        x["series_type"].eq("latest_revised")
+        &
+        x["monthly_variant"].eq(
+            "signal_cutoff"
+        )
+    ]
+    .sort_values(
+        ["month", "narrative_id"],
+        kind="stable",
+    )
+    .reset_index(drop=True)
+)
+```
+
+`weekly_incremental`のたびに、影響を受けた月次partitionが再計算されます。その後、保存済みの**全月次partition**を読み込み、Momentum signal directoryを再構築します。`02_fixed_narrative_intensity_incremental_memory_safe_implemented_japanese_polarity_xlsx.ipynb`
+
+# 9. Wide形式への変換
+
+## 月次negative intensity
+
+```python
+monthly_negative_wide = (
+    monthly_signal
+    .pivot(
+        index="month",
+        columns="narrative_id",
+        values="negative_intensity_hard",
+    )
+    .sort_index()
+)
+```
+
+## 月次positive intensity
+
+```python
+monthly_positive_wide = (
+    monthly_signal
+    .pivot(
+        index="month",
+        columns="narrative_id",
+        values="positive_intensity_hard",
+    )
+    .sort_index()
+)
+```
+
+## 月次coverage intensity
+
+```python
+monthly_coverage_wide = (
+    monthly_signal
+    .pivot(
+        index="month",
+        columns="narrative_id",
+        values="coverage_intensity",
+    )
+    .sort_index()
+)
+```
+
+## 週次Narrative beta推定用
+
+```python
+weekly_latest = (
+    full_history["weekly"]
+    .loc[
+        lambda x:
+        x["series_type"].eq("latest_revised")
+    ]
+    .copy()
+)
+
+weekly_negative_wide = (
+    weekly_latest
+    .pivot(
+        index="week_end_wednesday",
+        columns="narrative_id",
+        values="negative_intensity_hard",
+    )
+    .sort_index()
+)
+
+weekly_change_wide = (
+    weekly_latest
+    .pivot(
+        index="week_end_wednesday",
+        columns="narrative_id",
+        values="negative_intensity_change",
+    )
+    .sort_index()
+)
+```
+
+文献では日次Narrative Intensityを月平均し、週次では木曜から翌水曜の日次Intensityを平均して、その週次変化をNarrative beta推定に使用します。`Narrative Momentum.pdf` `Narrative Momentum.pdf`
+
+# 10. 複数runの返り値を連結してはいけない理由
+
+次は非推奨です。
+
+```python
+all_daily = pd.concat([
+    initial_result.daily_aggregate,
+    weekly_result_1.daily_aggregate,
+    weekly_result_2.daily_aggregate,
+    weekly_result_3.daily_aggregate,
+])
+```
+
+例えば第3回weeklyで過去記事が訂正された場合、
+
+```text
+第1回で計算された古い日次Intensity
+第3回で再計算された新しい日次Intensity
+```
+
+が同時に残ってしまいます。
+
+Store側では、同一partitionの既存データと新規データを結合し、business keyで`keep="last"`としてupsertします。`02_fixed_narrative_intensity_incremental_memory_safe_implemented_japanese_polarity_xlsx.ipynb`
+
+したがって、正式なロード元は常に、
+
+```text
+store.daily_aggregate_dir
+store.weekly_dir
+store.monthly_dir
+store.signal_dir
+```
+
+です。
+
+# 11. 期間指定でロードする場合
+
+全期間が大きい場合、期間を限定できます。
+
+```python
+cfg = finalize_config(PRODUCTION_CONFIG)
+
+store = FixedNarrativeStore(
+    cfg["store_root"],
+    cfg["classification_epoch"],
+)
+
+dates = (
+    pd.date_range(
+        "2025-01-01",
+        "2026-07-31",
+        freq="D",
+    )
+    .strftime("%Y-%m-%d")
+    .tolist()
+)
+
+daily_subset = store.read_partitions(
+    store.daily_aggregate_dir,
+    partition_col="date",
+    partition_values=dates,
+    columns=[
+        "date",
+        "narrative_id",
+        "series_type",
+        "negative_intensity_hard",
+        "positive_intensity_hard",
+        "coverage_intensity",
+        "n_total",
+        "n_theme",
+    ],
+)
+```
+
+この方法は必要な日付partitionしか読み込まないため、メモリ使用量を抑えられます。
+
+# 12. Point-in-time系列は別途materializeする
+
+全partitionからロードしたデータは、訂正・削除・遅延到着を反映した、
+
+```text
+latest_revised
+```
+
+です。
+
+過去の特定時点で実際に利用可能だった記事だけを用いる場合は、
+
+```python
+pit_result = materialize_point_in_time_series(...)
+```
+
+を使用します。
+
+これはcurrent Storeとは別に、
+
+```text
+fixed_narratives/point_in_time/
+classification_epoch=<epoch>/
+as_of=<cutoff>/
+```
+
+へ保存されます。関数は記事state、assignment history、sentiment historyをcutoff時点で再構成し、日次、週次、月次、signalを作成します。`02_fixed_narrative_intensity_incremental_memory_safe_implemented_japanese_polarity_xlsx.ipynb`
+
+# 13. 実務上の完成形
+
+```python
+# --------------------------------------------------
+# 1. 初回
+# --------------------------------------------------
+initial_result = run_fixed_narrative_update(
+    historical_articles_df,
+    PRODUCTION_CONFIG,
+    run_mode="initial_full",
+)
+
+# --------------------------------------------------
+# 2. 複数回の週次更新
+# --------------------------------------------------
+last_result = initial_result
+
+for weekly_df in weekly_article_batches:
+    last_result = run_fixed_narrative_update(
+        weekly_df,
+        PRODUCTION_CONFIG,
+        run_mode="weekly_incremental",
+    )
+
+# --------------------------------------------------
+# 3. 全期間の最新Canonical Storeをロード
+# --------------------------------------------------
+full_history = load_full_narrative_intensity_history(
+    store_root=last_result.store_root,
+    classification_epoch=(
+        last_result.classification_epoch
+    ),
+)
+
+# --------------------------------------------------
+# 4. 運用シグナル用
+# --------------------------------------------------
+monthly_signal = (
+    full_history["monthly"]
+    .loc[
+        lambda x:
+        x["series_type"].eq("latest_revised")
+        &
+        x["monthly_variant"].eq(
+            "signal_cutoff"
+        )
+    ]
+    .reset_index(drop=True)
+)
+
+momentum_signals = (
+    full_history["signals"]
+    .loc[
+        lambda x:
+        x["series_type"].eq("latest_revised")
+    ]
+    .reset_index(drop=True)
+)
+
+# --------------------------------------------------
+# 5. Narrative beta用
+# --------------------------------------------------
+weekly_intensity = (
+    full_history["weekly"]
+    .loc[
+        lambda x:
+        x["series_type"].eq("latest_revised")
+    ]
+    .reset_index(drop=True)
+)
+```
+
+後段のNarrative MapへはIntensity系列そのものではなく、固定Narrativeごとに抽出したtime-stamped記事集合を渡します。Narrative Map論文の形式的な入力も、特定issueに関する時刻付き文書集合と開始・終了イベントです。`2009.04508v2.pdf`
+
+要点は次です。
+
+```text
+initial_fullの返り値
+    = 初回runの結果
+
+各weekly_incrementalの返り値
+    = 各runで更新した差分
+
+runs/<run_id>
+    = 各runの監査用スナップショット
+
+FixedNarrativeStoreの全partition
+    = initial_full + 全weekly実行を反映した
+      全期間の最新Canonical時系列
 ```
 
 
